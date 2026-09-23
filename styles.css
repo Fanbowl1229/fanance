@@ -418,6 +418,21 @@ a {
   color: var(--text-muted);
 }
 
+.month-chip {
+  display: inline-flex;
+  align-items: center;
+  margin: 0 16px 10px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.list-item.muted-row {
+  opacity: 0.55;
+}
 .note-box {
   background: var(--warn-soft);
   border: 1px solid #d4a01744;
