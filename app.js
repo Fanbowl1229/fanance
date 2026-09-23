@@ -40,7 +40,14 @@
       "takeHome": 19000,
       "monthlyCap": 8000,
       "currency": "HKD",
-      "name": "Fanance"
+      "name": "Fanance",
+      "categoryBudgets": {
+        "飲食": 2500,
+        "交通": 900,
+        "購物": 1500,
+        "娛樂": 800,
+        "其他": 800
+      }
     },
     "accounts": [
       {
@@ -208,9 +215,174 @@
     return (Number(inst.monthly) || 0) + (Number(inst.fee) || 0);
   }
 
-  function sumInstalments() {
-    return (data.instalments || []).reduce((s, x) => s + instalmentMonthly(x), 0);
+  function isInstalmentActive(inst) {
+    if (!inst || inst.active === false) return false;
+    const rem = inst.remaining != null ? Number(inst.remaining) : null;
+    const remP = inst.remainingPeriods != null ? Number(inst.remainingPeriods) : null;
+    if (rem != null && !Number.isNaN(rem) && rem <= 0) return false;
+    if (remP != null && !Number.isNaN(remP) && remP <= 0) return false;
+    if (inst.endMonth && monthKey() > String(inst.endMonth)) return false;
+    return true;
   }
+
+  function activeInstalments() {
+    return (data.instalments || []).filter(isInstalmentActive);
+  }
+
+  function sumInstalments() {
+    return activeInstalments().reduce((s, x) => s + instalmentMonthly(x), 0);
+  }
+
+  function formatMonthLabel(mk) {
+    const parts = String(mk || "").split("-");
+    if (parts.length < 2) return mk || "";
+    return `${parts[0]}年${parseInt(parts[1], 10)}月`;
+  }
+
+  function spendForMonthKey(mk, discretionaryOnly) {
+    return (data.transactions || [])
+      .filter((t) => {
+        if (!String(t.date || "").startsWith(mk)) return false;
+        if (discretionaryOnly && ["固定", "卡數"].includes(t.category)) return false;
+        return true;
+      })
+      .reduce((s, t) => s + (Number(t.amount) || 0), 0);
+  }
+
+  function countTxForMonth(mk) {
+    return (data.transactions || []).filter((t) => String(t.date || "").startsWith(mk)).length;
+  }
+
+  /** Automatic month rollover — archive prior month, tick instalments, no fake sub txs */
+  function runMonthRolloverIfNeeded() {
+    if (!data) return false;
+    const current = monthKey();
+    const last = data.lastMonthKey || null;
+
+    if (!Array.isArray(data.monthHistory)) data.monthHistory = [];
+
+    // First run / upgrade: stamp current month, no big modal
+    if (!last) {
+      data.lastMonthKey = current;
+      touchUpdated();
+      toast("已設定為本月 " + current, "ok");
+      return false;
+    }
+
+    if (last === current) return false;
+
+    // Archive the stored lastMonthKey once (even if user skipped months)
+    const disc = spendForMonthKey(last, true);
+    const all = spendForMonthKey(last, false);
+    const txCount = countTxForMonth(last);
+    const archiveEntry = {
+      month: last,
+      archivedAt: nowISO(),
+      discretionarySpend: disc,
+      allSpend: all,
+      accountsTotal: accountsTotal(),
+      leftoverEstimate: leftover(),
+      transactionCount: txCount,
+    };
+    data.monthHistory.push(archiveEntry);
+    if (data.monthHistory.length > 36) {
+      data.monthHistory = data.monthHistory.slice(-36);
+    }
+
+    // Tick instalments for the new month
+    (data.instalments || []).forEach((i) => {
+      if (typeof i.remaining === "number" && !Number.isNaN(i.remaining)) {
+        i.remaining = Math.max(0, i.remaining - 1);
+      }
+      if (typeof i.remainingPeriods === "number" && !Number.isNaN(i.remainingPeriods)) {
+        i.remainingPeriods = Math.max(0, i.remainingPeriods - 1);
+      }
+      if (i.endMonth && current > String(i.endMonth)) {
+        i.active = false;
+      }
+      if (
+        (typeof i.remaining === "number" && i.remaining <= 0) ||
+        (typeof i.remainingPeriods === "number" && i.remainingPeriods <= 0)
+      ) {
+        i.active = false;
+      }
+      // Keep octStatementOverride only during 2026-10; clear otherwise
+      if (i.octStatementOverride != null && current !== "2026-10") {
+        delete i.octStatementOverride;
+      }
+      if (i.notes && /十月結單|十月例外/.test(i.notes) && current > "2026-10") {
+        i.notes = String(i.notes)
+          .replace(/[；;]?\s*十月結單[^；;]*/g, "")
+          .replace(/[；;]?\s*十月例外[^；;]*/g, "")
+          .trim();
+      }
+    });
+
+    (data.cards || []).forEach((c) => {
+      if (c.notes && /十月結單/.test(c.notes) && current > "2026-10") {
+        c.notes = String(c.notes)
+          .replace(/[；;]?\s*十月結單[^；;]*/g, "")
+          .trim();
+      }
+    });
+
+    const expectedItems = [];
+    (data.subscriptions || []).forEach((s) => {
+      expectedItems.push({ kind: "固定", name: s.name, amount: Number(s.amount) || 0 });
+    });
+    activeInstalments().forEach((i) => {
+      expectedItems.push({ kind: "卡數", name: i.name, amount: instalmentMonthly(i) });
+    });
+    const expectedTotal = expectedItems.reduce((s, x) => s + (Number(x.amount) || 0), 0);
+
+    data.lastMonthKey = current;
+    touchUpdated();
+
+    showRolloverSheet({
+      current,
+      archive: archiveEntry,
+      expectedItems,
+      expectedTotal,
+    });
+    return true;
+  }
+
+  function showRolloverSheet({ current, archive, expectedItems, expectedTotal }) {
+    const listHtml = expectedItems.length
+      ? `<ul class="list">${expectedItems
+          .map(
+            (x) => `
+          <li class="list-item">
+            <div class="meta">
+              <div class="title">${esc(x.name)}</div>
+              <div class="sub">${esc(x.kind)}</div>
+            </div>
+            <div class="amt">${money(x.amount)}</div>
+          </li>`
+          )
+          .join("")}</ul>`
+      : `<div class="empty">未有預期固定項目</div>`;
+
+    openSheet(`
+      <div class="sheet-handle"></div>
+      <h3>已進入 ${esc(formatMonthLabel(current))}</h3>
+      <div class="card" style="margin-bottom:12px">
+        <h2 style="font-size:0.95rem;margin:0 0 8px">上個月摘要（${esc(archive.month)}）</h2>
+        <div class="hero-sub">開支合計 ${money(archive.allSpend)} · 非固定／卡數 ${money(archive.discretionarySpend)}</div>
+        <div class="hero-sub">交易 ${archive.transactionCount} 筆 · 戶口合計當時 ${money(archive.accountsTotal)}</div>
+      </div>
+      <div class="card" style="margin-bottom:12px;padding:4px 12px">
+        <div class="section-title" style="margin:8px 0"><span>本月預期固定</span><span>${money(expectedTotal)}</span></div>
+        ${listHtml}
+        <div class="hero-sub" style="padding:8px 4px 12px">唔會自動記帳——請你確認付款後再喺「記帳」入數。</div>
+      </div>
+      <div class="note-box" style="margin-bottom:14px">提醒：卡結單金額可能變，請喺「卡數」更新。</div>
+      <button type="button" class="btn btn-primary" id="btnRolloverOk">知道了</button>
+    `);
+    const ok = $("#btnRolloverOk");
+    if (ok) ok.onclick = () => closeSheet();
+  }
+
 
   function monthlyFixed() {
     return sumSubs() + sumInstalments();
@@ -272,7 +444,7 @@
       }
     });
 
-    (data.instalments || []).forEach((i) => {
+    activeInstalments().forEach((i) => {
       const d = nextDueDate(i.dueDay);
       if (!d) return;
       const diff = Math.round((d - today) / 86400000);
@@ -342,8 +514,9 @@
     const over = discSpend > cap;
     const dues = upcomingDues(14);
     const take = data.profile.takeHome;
+    const mk = monthKey();
 
-    const octNotes = (data.instalments || []).filter((i) => i.octStatementOverride);
+    const octNotes = activeInstalments().filter((i) => i.octStatementOverride);
     const octHtml = octNotes.length
       ? `<div class="note-box">十月結單提示：${octNotes
           .map((i) => `${esc(i.name)} 約 ${money(i.octStatementOverride)}（含分期）`)
@@ -351,6 +524,7 @@
       : "";
 
     el.innerHTML = `
+      <div class="month-chip">本月 ${esc(mk)}</div>
       <div class="card">
         <h2>估計每月剩錢</h2>
         <div class="hero-amount ${left >= 0 ? "positive" : "negative"}">${money(left)}</div>
@@ -663,18 +837,21 @@
           ${inst
             .map((i) => {
               const card = cards.find((c) => c.id === i.cardId);
+              const active = isInstalmentActive(i);
               const rem =
                 i.remaining != null
                   ? `剩 ${i.remaining} 期`
-                  : i.endMonth
-                    ? `至 ${i.endMonth}`
-                    : "進行中";
+                  : i.remainingPeriods != null
+                    ? `剩 ${i.remainingPeriods} 期`
+                    : i.endMonth
+                      ? `至 ${i.endMonth}`
+                      : "進行中";
               return `
-              <li class="list-item">
+              <li class="list-item${!active ? " muted-row" : ""}">
                 <div class="meta">
                   <div class="title">${esc(i.name)}${i.pendingConfirm ? '<span class="tag">待確認</span>' : ""}${
                     i.octStatementOverride ? '<span class="tag muted">十月結單</span>' : ""
-                  }</div>
+                  }${!active ? '<span class="tag muted">已結束</span>' : ""}</div>
                   <div class="sub">${card ? esc(card.name) : ""} · ${i.dueDay || "—"} 號 · ${rem}
                     ${i.fee ? ` · 手續費 ${money(i.fee)}` : ""}
                     ${i.notes ? " · " + esc(i.notes) : ""}
@@ -858,6 +1035,31 @@
       </div>
 
       <div class="card settings-block">
+        <h2>過往月份</h2>
+        ${
+          (data.monthHistory || []).length
+            ? `<ul class="list">${[...(data.monthHistory || [])]
+                .slice()
+                .reverse()
+                .slice(0, 8)
+                .map(
+                  (h) => `
+              <li class="list-item">
+                <div class="meta">
+                  <div class="title">${esc(h.month)}</div>
+                  <div class="sub">${h.transactionCount || 0} 筆 · 非固定 ${money(h.discretionarySpend || 0)}</div>
+                </div>
+                <div class="amt">${money(h.allSpend || 0)}</div>
+              </li>`
+                )
+                .join("")}</ul>
+              <p class="hero-sub" style="margin-top:8px">本月標記：<span class="mono">${esc(data.lastMonthKey || "—")}</span></p>`
+            : `<p>未有轉月紀錄。首次開啟會標記本月，之後每個新月會自動封存上個月摘要。</p>
+              <p>本月標記：<span class="mono">${esc(data.lastMonthKey || "—")}</span></p>`
+        }
+      </div>
+
+      <div class="card settings-block">
         <h2>關於</h2>
         <p>Fanance · 個人用 · zh-Hant-HK</p>
         <p>OAuth 需要 HTTPS 或 localhost。手機「加入主畫面」可用 PWA。</p>
@@ -885,6 +1087,7 @@
           if (!parsed || typeof parsed !== "object" || !parsed.profile) throw new Error("格式唔啱");
           data = parsed;
           touchUpdated();
+          runMonthRolloverIfNeeded();
           toast("已匯入", "ok");
           render();
         } catch (err) {
@@ -900,6 +1103,7 @@
       data.updatedAt = nowISO();
       meta.driveFileId = null;
       saveLocal();
+      runMonthRolloverIfNeeded();
       toast("已重設", "ok");
       render();
     };
@@ -1139,6 +1343,7 @@
         if (remoteT > localT) {
           data = remote;
           saveLocal();
+          runMonthRolloverIfNeeded();
           if (showToast) toast("已由 Drive 拉最新資料", "ok");
         } else if (localT > remoteT) {
           await pushRemote();
@@ -1183,6 +1388,7 @@
     });
 
     initGis();
+    runMonthRolloverIfNeeded();
     render();
 
     if ("serviceWorker" in navigator) {
