@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "updatedAt": "2026-09-23T00:00:00.000Z",
+  "profile": {
+    "salaryGross": 20000,
+    "mpfRate": 0.05,
+    "takeHome": 19000,
+    "monthlyCap": 8000,
+    "currency": "HKD",
+    "name": "Fanance"
+  },
+  "accounts": [
+    {
+      "id": "acc-bank1",
+      "name": "銀行 A",
+      "balance": 5000,
+      "asOf": "2026-09-01"
+    },
+    {
+      "id": "acc-bank2",
+      "name": "銀行 B",
+      "balance": 1200,
+      "asOf": "2026-09-01"
+    },
+    {
+      "id": "acc-cash",
+      "name": "現金",
+      "balance": 300
+    },
+    {
+      "id": "acc-other",
+      "name": "其他",
+      "balance": 0
+    }
+  ],
+  "cards": [
+    {
+      "id": "card-a",
+      "name": "信用卡 A",
+      "dueDay": 12,
+      "notes": "示範卡"
+    },
+    {
+      "id": "card-b",
+      "name": "信用卡 B",
+      "dueDay": 7,
+      "notes": ""
+    }
+  ],
+  "instalments": [
+    {
+      "id": "inst-demo-1",
+      "cardId": "card-a",
+      "name": "示範分期",
+      "monthly": 1500,
+      "fee": 50,
+      "remaining": 6,
+      "endMonth": "2027-03",
+      "dueDay": 12,
+      "notes": "公開示範資料，非真實帳目"
+    }
+  ],
+  "subscriptions": [
+    {
+      "id": "sub-stream",
+      "name": "串流",
+      "amount": 100,
+      "dueDay": 3
+    },
+    {
+      "id": "sub-transit",
+      "name": "交通月票",
+      "amount": 500,
+      "dueDay": 14
+    },
+    {
+      "id": "sub-phone",
+      "name": "電話費",
+      "amount": 200,
+      "dueDay": 20
+    }
+  ],
+  "transactions": [
+    {
+      "id": "tx-demo-1",
+      "date": "2026-09-10",
+      "amount": 85,
+      "category": "飲食",
+      "account": "銀行 A",
+      "note": "示範午餐"
+    },
+    {
+      "id": "tx-demo-2",
+      "date": "2026-09-12",
+      "amount": 220,
+      "category": "購物",
+      "account": "銀行 B",
+      "note": "示範購物"
+    }
+  ]
+}

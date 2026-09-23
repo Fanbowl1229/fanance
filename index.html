@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-Hant-HK">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#1a7f5a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Fanance" />
+  <meta name="description" content="Fanance — 個人粵語理財：記帳、固定開支、卡數" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icons/icon-192.png" type="image/png" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <title>Fanance 理財</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="config.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+  <div class="app" id="app">
+    <header class="app-header">
+      <h1>Fanance</h1>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="sync-dot" id="syncDot" title="同步狀態"></span>
+        <span class="badge" id="modeBadge">演示模式</span>
+      </div>
+    </header>
+
+    <!-- 總覽 -->
+    <section class="view active" id="view-overview" data-view="overview"></section>
+    <!-- 記帳 -->
+    <section class="view" id="view-ledger" data-view="ledger"></section>
+    <!-- 固定 -->
+    <section class="view" id="view-subs" data-view="subs"></section>
+    <!-- 卡數 -->
+    <section class="view" id="view-cards" data-view="cards"></section>
+    <!-- 設定 -->
+    <section class="view" id="view-settings" data-view="settings"></section>
+
+    <nav class="bottom-nav" aria-label="主導航">
+      <div class="nav-inner">
+        <button type="button" class="nav-btn active" data-nav="overview"><span class="ico">◎</span>總覽</button>
+        <button type="button" class="nav-btn" data-nav="ledger"><span class="ico">＋</span>記帳</button>
+        <button type="button" class="nav-btn" data-nav="subs"><span class="ico">↻</span>固定</button>
+        <button type="button" class="nav-btn" data-nav="cards"><span class="ico">▭</span>卡數</button>
+        <button type="button" class="nav-btn" data-nav="settings"><span class="ico">⚙</span>設定</button>
+      </div>
+    </nav>
+  </div>
+
+  <div class="overlay" id="overlay" role="dialog" aria-modal="true">
+    <div class="sheet" id="sheet"></div>
+  </div>
+
+  <div class="toast-wrap" id="toasts" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
