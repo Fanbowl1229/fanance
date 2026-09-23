@@ -362,6 +362,18 @@ a {
 .list-item .amt.out {
   color: var(--text);
 }
+.list-item .amt.in {
+  color: var(--ok);
+}
+.cat-budget-row {
+  margin-bottom: 10px;
+}
+.cat-budget-row:last-child {
+  margin-bottom: 0;
+}
+.payroll-card .btn {
+  width: 100%;
+}
 .list-actions {
   display: flex;
   gap: 4px;

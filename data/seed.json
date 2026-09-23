@@ -7,7 +7,14 @@
     "takeHome": 19000,
     "monthlyCap": 8000,
     "currency": "HKD",
-    "name": "Fanance"
+    "name": "Fanance",
+    "categoryBudgets": {
+      "飲食": 2500,
+      "交通": 900,
+      "購物": 1500,
+      "娛樂": 800,
+      "其他": 800
+    }
   },
   "accounts": [
     {
