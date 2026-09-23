@@ -6,6 +6,15 @@
   const STORAGE_KEY = "fanance-data-v1";
   const META_KEY = "fanance-meta-v1";
   const CATEGORIES = ["飲食", "交通", "購物", "娛樂", "固定", "卡數", "其他"];
+  const INCOME_CATEGORY = "收入";
+  const BUDGET_CATS = ["飲食", "交通", "購物", "娛樂", "其他"];
+  const DEFAULT_CATEGORY_BUDGETS = {
+    "飲食": 2500,
+    "交通": 900,
+    "購物": 1500,
+    "娛樂": 800,
+    "其他": 800,
+  };
   const ACCOUNT_NAMES = ["HSBC", "Hang Seng", "Mox", "現金", "其他"];
 
   const CFG = Object.assign(
@@ -39,6 +48,13 @@
       "mpfRate": 0.05,
       "takeHome": 20900,
       "monthlyCap": 8000,
+      "categoryBudgets": {
+        "飲食": 2500,
+        "交通": 900,
+        "購物": 1500,
+        "娛樂": 800,
+        "其他": 800
+      },
       "currency": "HKD",
       "name": "Fanance"
     },
@@ -307,6 +323,69 @@
     return false;
   }
 
+  function isIncome(t) {
+    return t && t.type === "income";
+  }
+
+  function isExpense(t) {
+    return !isIncome(t);
+  }
+
+  /** Once: seed default categoryBudgets if missing; never wipe user edits */
+  function ensureCategoryBudgets() {
+    if (!data || !data.profile) return false;
+    if (!data.profile.categoryBudgets || typeof data.profile.categoryBudgets !== "object") {
+      data.profile.categoryBudgets = Object.assign({}, DEFAULT_CATEGORY_BUDGETS);
+      return true;
+    }
+    return false;
+  }
+
+  function migrateData() {
+    let changed = false;
+    if (ensureCategoryBudgets()) changed = true;
+    (data.transactions || []).forEach((t) => {
+      if (t.type == null) {
+        /* legacy = expense; leave unset for backward-compatible reads via isExpense */
+      }
+    });
+    if (changed) {
+      touchUpdated();
+    }
+    return changed;
+  }
+
+  function monthIncomeTotal() {
+    return (data.transactions || [])
+      .filter((t) => isIncome(t) && isCurrentMonth(t.date))
+      .reduce((s, t) => s + (Number(t.amount) || 0), 0);
+  }
+
+  function monthSpendByCategory(cat) {
+    return (data.transactions || [])
+      .filter((t) => isExpense(t) && isCurrentMonth(t.date) && t.category === cat)
+      .reduce((s, t) => s + (Number(t.amount) || 0), 0);
+  }
+
+  function adjustAccountBalance(accountName, delta) {
+    const acc = (data.accounts || []).find((a) => a.name === accountName);
+    if (!acc) return false;
+    acc.balance = (Number(acc.balance) || 0) + (Number(delta) || 0);
+    acc.asOf = todayISO();
+    return true;
+  }
+
+  function maybeBudgetToast(category) {
+    const budgets = (data.profile && data.profile.categoryBudgets) || {};
+    const cap = Number(budgets[category]);
+    if (!cap || cap <= 0) return;
+    if (["固定", "卡數", INCOME_CATEGORY].includes(category)) return;
+    const spent = monthSpendByCategory(category);
+    if (spent > cap) {
+      toast(`${category} 已超預算（${money(spent)}／${money(cap)}）`, "error");
+    }
+  }
+
   // ——— Calculations ———
   function sumSubs() {
     return (data.subscriptions || []).reduce((s, x) => s + (Number(x.amount) || 0), 0);
@@ -343,6 +422,7 @@
   function spendForMonthKey(mk, discretionaryOnly) {
     return (data.transactions || [])
       .filter((t) => {
+        if (!isExpense(t)) return false;
         if (!String(t.date || "").startsWith(mk)) return false;
         if (discretionaryOnly && ["固定", "卡數"].includes(t.category)) return false;
         return true;
@@ -503,15 +583,20 @@
   }
 
   function monthSpendDiscretionary() {
-    // Cap track: exclude 固定 / 卡數 categories as "fixed" for display of discretionary
+    // Cap track: exclude 固定 / 卡數 / income
     return (data.transactions || [])
-      .filter((t) => isCurrentMonth(t.date) && !["固定", "卡數"].includes(t.category))
+      .filter(
+        (t) =>
+          isExpense(t) &&
+          isCurrentMonth(t.date) &&
+          !["固定", "卡數"].includes(t.category)
+      )
       .reduce((s, t) => s + (Number(t.amount) || 0), 0);
   }
 
   function monthSpendAll() {
     return (data.transactions || [])
-      .filter((t) => isCurrentMonth(t.date))
+      .filter((t) => isExpense(t) && isCurrentMonth(t.date))
       .reduce((s, t) => s + (Number(t.amount) || 0), 0);
   }
 
@@ -616,6 +701,8 @@
     const dues = upcomingDues(14);
     const take = data.profile.takeHome;
     const mk = monthKey();
+    const incomeMonth = monthIncomeTotal();
+    const budgets = (data.profile && data.profile.categoryBudgets) || {};
 
     const octNotes = activeInstalments().filter((i) => i.octStatementOverride);
     const octHtml = octNotes.length
@@ -624,6 +711,23 @@
           .join("；")}</div>`
       : "";
 
+    const budgetRows = BUDGET_CATS.filter((c) => Number(budgets[c]) > 0)
+      .map((c) => {
+        const capB = Number(budgets[c]) || 0;
+        const spent = monthSpendByCategory(c);
+        const pctB = capB ? Math.min(100, Math.round((spent / capB) * 100)) : 0;
+        const overB = spent > capB;
+        return `
+          <div class="cat-budget-row ${overB ? "over" : ""}">
+            <div class="progress-meta">
+              <span>${esc(c)}</span>
+              <span>${money(spent)}／${money(capB)}${overB ? " · 超咗" : ""}</span>
+            </div>
+            <div class="progress ${overB ? "over" : ""}"><span style="width:${pctB}%"></span></div>
+          </div>`;
+      })
+      .join("");
+
     el.innerHTML = `
       <div class="month-chip">本月 ${esc(mk)}</div>
       <div class="card">
@@ -631,6 +735,13 @@
         <div class="hero-amount ${left >= 0 ? "positive" : "negative"}">${money(left)}</div>
         <div class="hero-sub">實收 ${money(take)} − 固定 ${money(sumSubs())} − 卡數分期 ${money(sumInstalments())}</div>
         ${octHtml}
+      </div>
+
+      <div class="card payroll-card">
+        <h2>出糧入帳</h2>
+        <div class="hero-sub" style="margin-bottom:10px">一鍵將實收薪金記入戶口（收入）</div>
+        <button type="button" class="btn btn-primary" id="btnPayroll">出糧入帳</button>
+        <div class="hero-sub" style="margin-top:10px">本月已入帳收入 ${money(incomeMonth)}</div>
       </div>
 
       <div class="card">
@@ -645,6 +756,15 @@
           ${room < 0 ? "（固定已超目標）" : ""}
         </div>
         <div class="hero-sub">本月記帳總額 ${money(allSpend)}</div>
+      </div>
+
+      <div class="card">
+        <h2>分類預算</h2>
+        ${
+          budgetRows
+            ? budgetRows
+            : `<div class="empty">未設定分類預算 — 去「設定」加入</div>`
+        }
       </div>
 
       <div class="grid-2">
@@ -686,6 +806,66 @@
         }
       </div>
     `;
+
+    const btnPay = $("#btnPayroll");
+    if (btnPay) btnPay.onclick = () => openPayrollSheet();
+  }
+
+  function openPayrollSheet() {
+    const take = Number(data.profile.takeHome) || 0;
+    const accNames = (data.accounts || []).map((a) => a.name);
+    const names = accNames.length ? accNames : ACCOUNT_NAMES;
+    const defaultAcc = names.includes("HSBC") ? "HSBC" : names[0];
+    openSheet(`
+      <div class="sheet-handle"></div>
+      <h3>出糧入帳</h3>
+      <div class="form-row"><label>金額（預設實收）</label>
+        <input class="input amount" type="number" id="payAmount" step="0.01" min="0" value="${take}" />
+      </div>
+      <div class="form-row"><label>入邊個戶口</label>
+        <div class="chips" id="payAcc">${names
+          .map(
+            (c) =>
+              `<button type="button" class="chip ${c === defaultAcc ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`
+          )
+          .join("")}</div>
+      </div>
+      <div class="form-row"><label>日期</label>
+        <input class="input" type="date" id="payDate" value="${todayISO()}" />
+      </div>
+      <div class="form-row"><label>備註</label>
+        <input class="input" type="text" id="payNote" value="出糧" maxlength="80" />
+      </div>
+      <div class="btn-row">
+        <button type="button" class="btn btn-secondary" id="payCancel">取消</button>
+        <button type="button" class="btn btn-primary" id="payConfirm">確認入帳</button>
+      </div>
+    `);
+    wireChips("#payAcc");
+    $("#payCancel").onclick = closeSheet;
+    $("#payConfirm").onclick = () => {
+      const amount = parseFloat($("#payAmount").value);
+      if (!amount || amount <= 0) {
+        toast("請輸入金額", "error");
+        return;
+      }
+      const account = chipValue("#payAcc") || defaultAcc;
+      const tx = {
+        id: uid("tx"),
+        date: $("#payDate").value || todayISO(),
+        amount,
+        category: INCOME_CATEGORY,
+        account,
+        note: ($("#payNote").value || "").trim() || "出糧",
+        type: "income",
+      };
+      data.transactions.push(tx);
+      adjustAccountBalance(account, amount);
+      touchUpdated();
+      closeSheet();
+      toast(`已入帳收入 ${money(amount)} → ${account}`, "ok");
+      renderOverview();
+    };
   }
 
   function renderLedger() {
@@ -696,10 +876,17 @@
       <div class="card">
         <h2>快速記帳</h2>
         <div class="form-row">
+          <label>類型</label>
+          <div class="chips" id="typeChips">
+            <button type="button" class="chip active" data-val="expense">支出</button>
+            <button type="button" class="chip" data-val="income">收入</button>
+          </div>
+        </div>
+        <div class="form-row">
           <label>金額（HKD）</label>
           <input class="input amount" type="number" inputmode="decimal" id="txAmount" placeholder="0" step="0.01" min="0" />
         </div>
-        <div class="form-row">
+        <div class="form-row" id="catRow">
           <label>類別</label>
           <div class="chips" id="catChips">
             ${CATEGORIES.map((c, i) => `<button type="button" class="chip ${i === 0 ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`).join("")}
@@ -727,28 +914,69 @@
         ${
           txs.length
             ? `<ul class="list">${txs
-                .map(
-                  (t) => `
+                .map((t) => {
+                  const inc = isIncome(t);
+                  const amtCls = inc ? "amt in" : "amt out";
+                  const amtTxt = inc ? "+" + money(t.amount) : money(t.amount);
+                  const typeTag = inc ? "收入" : "支出";
+                  return `
               <li class="list-item" data-id="${esc(t.id)}">
                 <div class="meta">
                   <div class="title">${esc(t.category)}${t.note ? " · " + esc(t.note) : ""}</div>
-                  <div class="sub">${esc(t.date)} · ${esc(t.account)}</div>
+                  <div class="sub">${esc(t.date)} · ${esc(t.account)} · ${typeTag}</div>
                 </div>
-                <div class="amt out">${money(t.amount)}</div>
+                <div class="${amtCls}">${amtTxt}</div>
                 <div class="list-actions">
                   <button type="button" class="icon-btn" data-edit-tx="${esc(t.id)}" aria-label="編輯">✎</button>
                   <button type="button" class="icon-btn danger" data-del-tx="${esc(t.id)}" aria-label="刪除">✕</button>
                 </div>
-              </li>`
-                )
+              </li>`;
+                })
                 .join("")}</ul>`
             : `<div class="empty">未有交易</div>`
         }
       </div>
     `;
 
+    wireChips("#typeChips");
     wireChips("#catChips");
     wireChips("#accChips");
+    const typeBox = $("#typeChips");
+    if (typeBox) {
+      const syncTypeUI = () => {
+        const typ = chipValue("#typeChips") || "expense";
+        const catRow = $("#catRow");
+        if (typ === "income") {
+          if (catRow) {
+            catRow.innerHTML = `<label>類別</label><div class="chips" id="catChips"><button type="button" class="chip active" data-val="${INCOME_CATEGORY}">${INCOME_CATEGORY}</button></div>`;
+            wireChips("#catChips");
+          }
+          const note = $("#txNote");
+          if (note && !note.value) note.placeholder = "例如：出糧";
+        } else {
+          if (catRow) {
+            catRow.innerHTML = `<label>類別</label><div class="chips" id="catChips">${CATEGORIES.map(
+              (c, i) =>
+                `<button type="button" class="chip ${i === 0 ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`
+            ).join("")}</div>`;
+            wireChips("#catChips");
+          }
+          const note = $("#txNote");
+          if (note) note.placeholder = "例如：午餐";
+        }
+      };
+      const prev = typeBox.onclick;
+      typeBox.onclick = (e) => {
+        if (typeof prev === "function") prev(e);
+        else {
+          const btn = e.target.closest(".chip");
+          if (!btn) return;
+          $$(".chip", typeBox).forEach((c) => c.classList.remove("active"));
+          btn.classList.add("active");
+        }
+        syncTypeUI();
+      };
+    }
     $("#btnAddTx").onclick = () => addTransaction();
     $$("[data-del-tx]").forEach((b) => (b.onclick = () => deleteTx(b.dataset.delTx)));
     $$("[data-edit-tx]").forEach((b) => (b.onclick = () => openEditTx(b.dataset.editTx)));
@@ -776,23 +1004,34 @@
       toast("請輸入金額", "error");
       return;
     }
+    const typ = chipValue("#typeChips") || "expense";
+    const isInc = typ === "income";
     const tx = {
       id: uid("tx"),
       date: $("#txDate").value || todayISO(),
       amount,
-      category: chipValue("#catChips") || "其他",
+      category: isInc ? INCOME_CATEGORY : chipValue("#catChips") || "其他",
       account: chipValue("#accChips") || "其他",
       note: ($("#txNote").value || "").trim(),
+      type: isInc ? "income" : "expense",
     };
     data.transactions.push(tx);
+    if (isInc) {
+      adjustAccountBalance(tx.account, amount);
+    }
     touchUpdated();
-    toast("已記帳", "ok");
+    toast(isInc ? "已記收入" : "已記帳", "ok");
+    if (!isInc) maybeBudgetToast(tx.category);
     renderLedger();
   }
 
   function deleteTx(id) {
     if (!confirm("刪除呢筆交易？")) return;
-    data.transactions = data.transactions.filter((t) => t.id !== id);
+    const t = data.transactions.find((x) => x.id === id);
+    if (t && isIncome(t)) {
+      adjustAccountBalance(t.account, -(Number(t.amount) || 0));
+    }
+    data.transactions = data.transactions.filter((x) => x.id !== id);
     touchUpdated();
     toast("已刪除", "ok");
     renderLedger();
@@ -801,12 +1040,27 @@
   function openEditTx(id) {
     const t = data.transactions.find((x) => x.id === id);
     if (!t) return;
+    const wasInc = isIncome(t);
+    const typ = wasInc ? "income" : "expense";
+    const catChips =
+      typ === "income"
+        ? `<button type="button" class="chip active" data-val="${INCOME_CATEGORY}">${INCOME_CATEGORY}</button>`
+        : CATEGORIES.map(
+            (c) =>
+              `<button type="button" class="chip ${c === t.category ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`
+          ).join("");
     openSheet(`
       <div class="sheet-handle"></div>
       <h3>編輯交易</h3>
+      <div class="form-row"><label>類型</label>
+        <div class="chips" id="eType">
+          <button type="button" class="chip ${typ === "expense" ? "active" : ""}" data-val="expense">支出</button>
+          <button type="button" class="chip ${typ === "income" ? "active" : ""}" data-val="income">收入</button>
+        </div>
+      </div>
       <div class="form-row"><label>金額</label><input class="input amount" id="eAmount" type="number" step="0.01" value="${t.amount}" /></div>
-      <div class="form-row"><label>類別</label>
-        <div class="chips" id="eCat">${CATEGORIES.map((c) => `<button type="button" class="chip ${c === t.category ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`).join("")}</div>
+      <div class="form-row" id="eCatRow"><label>類別</label>
+        <div class="chips" id="eCat">${catChips}</div>
       </div>
       <div class="form-row"><label>戶口</label>
         <div class="chips" id="eAcc">${ACCOUNT_NAMES.map((c) => `<button type="button" class="chip ${c === t.account ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`).join("")}</div>
@@ -818,18 +1072,53 @@
         <button type="button" class="btn btn-primary" id="eSave">儲存</button>
       </div>
     `);
+    wireChips("#eType");
     wireChips("#eCat");
     wireChips("#eAcc");
+    const eType = $("#eType");
+    if (eType) {
+      eType.onclick = (e) => {
+        const btn = e.target.closest(".chip");
+        if (!btn) return;
+        $$(".chip", eType).forEach((c) => c.classList.remove("active"));
+        btn.classList.add("active");
+        const nt = btn.dataset.val;
+        const row = $("#eCatRow");
+        if (!row) return;
+        if (nt === "income") {
+          row.innerHTML = `<label>類別</label><div class="chips" id="eCat"><button type="button" class="chip active" data-val="${INCOME_CATEGORY}">${INCOME_CATEGORY}</button></div>`;
+        } else {
+          const cur = t.category === INCOME_CATEGORY ? "其他" : t.category;
+          row.innerHTML = `<label>類別</label><div class="chips" id="eCat">${CATEGORIES.map(
+            (c) =>
+              `<button type="button" class="chip ${c === cur ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`
+          ).join("")}</div>`;
+        }
+        wireChips("#eCat");
+      };
+    }
     $("#eCancel").onclick = closeSheet;
     $("#eSave").onclick = () => {
-      t.amount = parseFloat($("#eAmount").value) || t.amount;
-      t.category = chipValue("#eCat") || t.category;
-      t.account = chipValue("#eAcc") || t.account;
+      const prevAmt = Number(t.amount) || 0;
+      const prevAcc = t.account;
+      const prevInc = isIncome(t);
+      const newType = chipValue("#eType") || "expense";
+      const newInc = newType === "income";
+      const newAmt = parseFloat($("#eAmount").value) || t.amount;
+      const newAcc = chipValue("#eAcc") || t.account;
+      t.amount = newAmt;
+      t.category = newInc ? INCOME_CATEGORY : chipValue("#eCat") || t.category;
+      t.account = newAcc;
       t.date = $("#eDate").value || t.date;
       t.note = ($("#eNote").value || "").trim();
+      t.type = newInc ? "income" : "expense";
+      // Rebalance accounts if income side changed
+      if (prevInc) adjustAccountBalance(prevAcc, -prevAmt);
+      if (newInc) adjustAccountBalance(newAcc, newAmt);
       touchUpdated();
       closeSheet();
       toast("已更新", "ok");
+      if (!newInc) maybeBudgetToast(t.category);
       renderLedger();
     };
   }
@@ -1126,6 +1415,17 @@
       </div>
 
       <div class="card settings-block">
+        <h2>預算分項</h2>
+        <p class="hero-sub">只計非固定／卡數嘅分類。留空或 0 = 唔設上限。</p>
+        ${BUDGET_CATS.map((c) => {
+          const v = (data.profile.categoryBudgets && data.profile.categoryBudgets[c]) || "";
+          return `<div class="form-row"><label>${esc(c)}</label><input class="input" type="number" min="0" step="1" data-budget-cat="${esc(c)}" value="${v}" placeholder="無上限" /></div>`;
+        }).join("")}
+        <div class="hero-sub" id="budgetSumHint" style="margin:8px 0 12px"></div>
+        <button type="button" class="btn btn-secondary" id="btnSaveBudgets">儲存預算分項</button>
+      </div>
+
+      <div class="card settings-block">
         <h2>備份</h2>
         <div class="btn-row" style="flex-direction:column">
           <button type="button" class="btn btn-secondary" id="btnExport">匯出 JSON</button>
@@ -1176,6 +1476,37 @@
       touchUpdated();
       toast("已儲存", "ok");
     };
+
+    function refreshBudgetSumHint() {
+      const hint = $("#budgetSumHint");
+      if (!hint) return;
+      let sum = 0;
+      $$("[data-budget-cat]").forEach((inp) => {
+        const n = parseFloat(inp.value);
+        if (n > 0) sum += n;
+      });
+      const cap = Number(data.profile.monthlyCap) || 8000;
+      hint.textContent = `分項合計 ${money(sum)} · 每月開支目標 ${money(cap)}${sum > cap ? "（分項高過總目標）" : ""}`;
+    }
+    refreshBudgetSumHint();
+    $$("[data-budget-cat]").forEach((inp) => {
+      inp.oninput = refreshBudgetSumHint;
+    });
+    const btnBud = $("#btnSaveBudgets");
+    if (btnBud) {
+      btnBud.onclick = () => {
+        if (!data.profile.categoryBudgets) data.profile.categoryBudgets = {};
+        $$("[data-budget-cat]").forEach((inp) => {
+          const cat = inp.dataset.budgetCat;
+          const n = parseFloat(inp.value);
+          if (!n || n <= 0) delete data.profile.categoryBudgets[cat];
+          else data.profile.categoryBudgets[cat] = n;
+        });
+        touchUpdated();
+        toast("已儲存預算分項", "ok");
+        refreshBudgetSumHint();
+      };
+    }
     $("#btnExport").onclick = exportJson;
     $("#btnImport").onclick = () => $("#importFile").click();
     $("#importFile").onchange = (e) => {
@@ -1187,6 +1518,7 @@
           const parsed = JSON.parse(reader.result);
           if (!parsed || typeof parsed !== "object" || !parsed.profile) throw new Error("格式唔啱");
           data = parsed;
+          ensureCategoryBudgets();
           touchUpdated();
           runMonthRolloverIfNeeded();
           toast("已匯入", "ok");
@@ -1202,6 +1534,7 @@
       if (!confirm("重設會清本地資料並還原種子。確定？")) return;
       data = JSON.parse(JSON.stringify(SEED));
       data.updatedAt = nowISO();
+      ensureCategoryBudgets();
       meta.driveFileId = null;
       saveLocal();
       runMonthRolloverIfNeeded();
@@ -1443,6 +1776,7 @@
         const remoteT = Date.parse(remote.updatedAt) || 0;
         if (remoteT > localT) {
           data = remote;
+          ensureCategoryBudgets();
           saveLocal();
           runMonthRolloverIfNeeded();
           if (showToast) toast("已由 Drive 拉最新資料", "ok");
@@ -1489,6 +1823,7 @@
     });
 
     initGis();
+    migrateData();
     runMonthRolloverIfNeeded();
     render();
 
