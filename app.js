@@ -15,7 +15,7 @@
     "娛樂": 800,
     "其他": 800,
   };
-  const ACCOUNT_NAMES = ["銀行 A", "銀行 B", "銀行 C", "現金", "其他"];
+  const ACCOUNT_NAMES = ["現金", "其他"]; // generic fallbacks; real account names come from data.accounts
 
   const CFG = Object.assign(
     {
@@ -155,6 +155,14 @@
 
   function uid(prefix) {
     return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+  }
+
+  function accountNames() {
+    const out = [];
+    [...(data && data.accounts ? data.accounts.map((a) => a.name) : []), ...ACCOUNT_NAMES].forEach((n) => {
+      if (n && !out.includes(n)) out.push(n);
+    });
+    return out;
   }
 
   function money(n) {
@@ -707,7 +715,7 @@
     const take = Number(data.profile.takeHome) || 0;
     const accNames = (data.accounts || []).map((a) => a.name);
     const names = accNames.length ? accNames : ACCOUNT_NAMES;
-    const defaultAcc = names.includes("銀行 A") ? "銀行 A" : names[0];
+    const defaultAcc = names[0];
     openSheet(`
       <div class="sheet-handle"></div>
       <h3>出糧入帳</h3>
@@ -787,7 +795,7 @@
         <div class="form-row">
           <label>戶口</label>
           <div class="chips" id="accChips">
-            ${ACCOUNT_NAMES.map((c, i) => `<button type="button" class="chip ${i === 0 ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`).join("")}
+            ${accountNames().map((c, i) => `<button type="button" class="chip ${i === 0 ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`).join("")}
           </div>
         </div>
         <div class="form-row">
@@ -955,7 +963,7 @@
         <div class="chips" id="eCat">${catChips}</div>
       </div>
       <div class="form-row"><label>戶口</label>
-        <div class="chips" id="eAcc">${ACCOUNT_NAMES.map((c) => `<button type="button" class="chip ${c === t.account ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`).join("")}</div>
+        <div class="chips" id="eAcc">${accountNames().map((c) => `<button type="button" class="chip ${c === t.account ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`).join("")}</div>
       </div>
       <div class="form-row"><label>日期</label><input class="input" type="date" id="eDate" value="${esc(t.date)}" /></div>
       <div class="form-row"><label>備註</label><input class="input" id="eNote" value="${esc(t.note || "")}" /></div>
@@ -1171,7 +1179,7 @@
       <div class="card" style="padding:4px 12px">
         <ul class="list">
           ${(data.accounts || [])
-            .filter((a) => a.balance || ["銀行 A", "銀行 B", "銀行 C"].includes(a.name))
+            .filter((a) => a.balance || a.asOf)
             .map(
               (a) => `
             <li class="list-item">
@@ -1533,7 +1541,7 @@
     const amount = normAmount(t.amount);
     if (!(amount > 0)) return null;
     const isInc = t.type === "income" || t.category === INCOME_CATEGORY;
-    const accNames = new Set([...ACCOUNT_NAMES, ...(data.accounts || []).map((a) => a.name)]);
+    const accNames = new Set(accountNames());
     const cat = String(t.category || "").trim();
     const acc = String(t.account || "").trim();
     return {
