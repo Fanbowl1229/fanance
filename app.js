@@ -1327,6 +1327,19 @@
         </div>
       </div>
 
+      <div class="card settings-block" id="mergeBlock">
+        <h2>合併匯入</h2>
+        <p class="hero-sub">加入新記錄，唔會刪除或取代現有資料。重複（同 id，或同日期＋金額＋類別＋備註）會自動略過。</p>
+        <div class="form-row"><label for="mergeText">貼上 Fanance 記錄</label>
+          <textarea class="textarea mono" id="mergeText" rows="5" placeholder='{"fanancePatch":1,"transactions":[...]}' autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+        </div>
+        <div class="btn-row" style="flex-direction:column">
+          <button type="button" class="btn btn-primary" id="btnMerge">合併</button>
+          <button type="button" class="btn btn-secondary" id="btnMergeFile">揀 JSON 檔合併</button>
+          <input type="file" id="mergeFile" accept="application/json,.json,text/plain" hidden />
+        </div>
+      </div>
+
       <div class="card settings-block">
         <h2>過往月份</h2>
         ${
@@ -1422,6 +1435,19 @@
       reader.readAsText(f);
       e.target.value = "";
     };
+    $("#btnMerge").onclick = () => {
+      const txt = $("#mergeText").value;
+      if (runMergeImport(txt)) $("#mergeText").value = "";
+    };
+    $("#btnMergeFile").onclick = () => $("#mergeFile").click();
+    $("#mergeFile").onchange = (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = () => runMergeImport(String(reader.result || ""));
+      reader.readAsText(f);
+      e.target.value = "";
+    };
     $("#btnReset").onclick = () => {
       if (!confirm("重設會清本地資料並還原種子。確定？")) return;
       data = JSON.parse(JSON.stringify(SEED));
@@ -1433,6 +1459,206 @@
       toast("已重設", "ok");
       render();
     };
+  }
+
+  // ——— 合併匯入 (merge import) ———
+  /** Parse pasted text leniently → payload object/array. Throws on failure. */
+  function parseMergeText(raw) {
+    let t = String(raw == null ? "" : raw).replace(/^\uFEFF/, "").trim();
+    // strip ``` code fences (```json … ```)
+    t = t.replace(/^```[a-zA-Z]*\s*/, "").replace(/\s*```\s*$/, "").trim();
+    // keep only the JSON part if surrounded by other text
+    const first = t.search(/[\[{]/);
+    const lastObj = t.lastIndexOf("}");
+    const lastArr = t.lastIndexOf("]");
+    const last = Math.max(lastObj, lastArr);
+    if (first > 0 || (last >= 0 && last < t.length - 1)) {
+      if (first >= 0 && last > first) t = t.slice(first, last + 1);
+    }
+    if (!t) throw new Error("冇內容");
+    const attempts = [
+      (x) => x,
+      // smart double quotes → "
+      (x) => x.replace(/[\u201C\u201D\u201E\u201F\u2033\u2036\uFF02]/g, '"'),
+      // + full-width structural punctuation → ASCII
+      (x) =>
+        x
+          .replace(/[\u201C\u201D\u201E\u201F\u2033\u2036\uFF02]/g, '"')
+          .replace(/\uFF5B/g, "{")
+          .replace(/\uFF5D/g, "}")
+          .replace(/\uFF3B/g, "[")
+          .replace(/\uFF3D/g, "]")
+          .replace(/\uFF1A/g, ":")
+          .replace(/\uFF0C/g, ",")
+          .replace(/\u3000/g, " "),
+      // + trailing commas
+      (x) =>
+        x
+          .replace(/[\u201C\u201D\u201E\u201F\u2033\u2036\uFF02]/g, '"')
+          .replace(/\uFF5B/g, "{")
+          .replace(/\uFF5D/g, "}")
+          .replace(/\uFF3B/g, "[")
+          .replace(/\uFF3D/g, "]")
+          .replace(/\uFF1A/g, ":")
+          .replace(/\uFF0C/g, ",")
+          .replace(/\u3000/g, " ")
+          .replace(/,\s*([}\]])/g, "$1"),
+    ];
+    let lastErr = null;
+    for (const fn of attempts) {
+      try {
+        return JSON.parse(fn(t));
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw new Error("JSON 格式唔啱（" + (lastErr && lastErr.message ? lastErr.message : "parse error") + "）");
+  }
+
+  function normAmount(v) {
+    if (typeof v === "number") return v;
+    const n = parseFloat(String(v == null ? "" : v).replace(/[^0-9.\-]/g, ""));
+    return Number.isFinite(n) ? n : NaN;
+  }
+
+  function txDedupeKey(t) {
+    return [String(t.date || ""), Number(t.amount) || 0, String(t.category || ""), String(t.note || "").trim()].join("|");
+  }
+
+  /** Normalise an incoming tx to the same shape addTransaction() creates. Returns null if invalid. */
+  function normaliseIncomingTx(t) {
+    if (!t || typeof t !== "object") return null;
+    const date = String(t.date || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date))) return null;
+    const amount = normAmount(t.amount);
+    if (!(amount > 0)) return null;
+    const isInc = t.type === "income" || t.category === INCOME_CATEGORY;
+    const accNames = new Set([...ACCOUNT_NAMES, ...(data.accounts || []).map((a) => a.name)]);
+    const cat = String(t.category || "").trim();
+    const acc = String(t.account || "").trim();
+    return {
+      id: t.id != null && String(t.id).trim() ? String(t.id).trim() : uid("tx"),
+      date,
+      amount,
+      category: isInc ? INCOME_CATEGORY : CATEGORIES.includes(cat) ? cat : "其他",
+      account: accNames.has(acc) ? acc : "其他",
+      note: String(t.note == null ? "" : t.note).trim(),
+      type: isInc ? "income" : "expense",
+    };
+  }
+
+  /** Pure planning step: what would be added / skipped. Does not mutate data. */
+  function planMerge(payload) {
+    let txIn = [];
+    let subsIn = [];
+    let instIn = [];
+    if (Array.isArray(payload)) txIn = payload;
+    else if (payload && typeof payload === "object") {
+      if (Array.isArray(payload.transactions)) txIn = payload.transactions;
+      if (Array.isArray(payload.subscriptions)) subsIn = payload.subscriptions;
+      if (Array.isArray(payload.instalments)) instIn = payload.instalments;
+      if (!txIn.length && !subsIn.length && !instIn.length && payload.date && payload.amount != null) txIn = [payload];
+    } else throw new Error("格式唔啱");
+
+    const ids = new Set((data.transactions || []).map((t) => String(t.id)));
+    const keys = new Set((data.transactions || []).map(txDedupeKey));
+    const plan = { tx: [], subs: [], inst: [], skipped: 0, invalid: 0 };
+    txIn.forEach((raw) => {
+      const t = normaliseIncomingTx(raw);
+      if (!t) {
+        plan.invalid++;
+        return;
+      }
+      const k = txDedupeKey(t);
+      if (ids.has(t.id) || keys.has(k)) {
+        plan.skipped++;
+        return;
+      }
+      ids.add(t.id);
+      keys.add(k);
+      plan.tx.push(t);
+    });
+    const subIds = new Set((data.subscriptions || []).map((x) => String(x.id)));
+    subsIn.forEach((x) => {
+      if (!x || typeof x !== "object" || !x.id || !x.name || subIds.has(String(x.id))) {
+        if (x && x.id && subIds.has(String(x.id))) plan.skipped++;
+        return;
+      }
+      subIds.add(String(x.id));
+      plan.subs.push(Object.assign({}, x, { amount: normAmount(x.amount) || 0 }));
+    });
+    const instIds = new Set((data.instalments || []).map((x) => String(x.id)));
+    instIn.forEach((x) => {
+      if (!x || typeof x !== "object" || !x.id || !x.name || instIds.has(String(x.id))) {
+        if (x && x.id && instIds.has(String(x.id))) plan.skipped++;
+        return;
+      }
+      instIds.add(String(x.id));
+      plan.inst.push(Object.assign({}, x));
+    });
+    return plan;
+  }
+
+  /** Apply a plan exactly like manual adds (income adjusts balance, expense doesn't). */
+  function applyMergePlan(plan) {
+    if (!data.transactions) data.transactions = [];
+    plan.tx.forEach((t) => {
+      data.transactions.push(t);
+      if (isIncome(t)) adjustAccountBalance(t.account, t.amount);
+    });
+    if (plan.subs.length) {
+      if (!data.subscriptions) data.subscriptions = [];
+      plan.subs.forEach((x) => data.subscriptions.push(x));
+    }
+    if (plan.inst.length) {
+      if (!data.instalments) data.instalments = [];
+      plan.inst.forEach((x) => data.instalments.push(x));
+    }
+    return plan.tx.length + plan.subs.length + plan.inst.length;
+  }
+
+  /** UI entry: parse → preview/confirm → apply → save/push/render/toast. Returns true if merged. */
+  function runMergeImport(text) {
+    let payload;
+    try {
+      payload = parseMergeText(text);
+    } catch (e) {
+      toast("合併失敗：" + e.message, "error");
+      return false;
+    }
+    let plan;
+    try {
+      plan = planMerge(payload);
+    } catch (e) {
+      toast("合併失敗：" + e.message, "error");
+      return false;
+    }
+    const n = plan.tx.length + plan.subs.length + plan.inst.length;
+    const extra = plan.invalid ? `，${plan.invalid} 筆格式唔啱` : "";
+    if (!n) {
+      toast(`冇新記錄（略過 ${plan.skipped} 筆重複${extra}）`, plan.invalid ? "error" : "ok");
+      return false;
+    }
+    const lines = plan.tx
+      .slice(0, 12)
+      .map((t) => `${t.date} ${t.type === "income" ? "收入" : t.category} ${money(t.amount)}${t.note ? " " + t.note : ""}`);
+    if (plan.tx.length > 12) lines.push(`…（仲有 ${plan.tx.length - 12} 筆）`);
+    plan.subs.forEach((x) => lines.push(`固定：${x.name} ${money(x.amount)}`));
+    plan.inst.forEach((x) => lines.push(`卡數分期：${x.name}`));
+    const total = plan.tx.filter(isExpense).reduce((s, t) => s + t.amount, 0);
+    const msg =
+      `將加入 ${n} 筆${total ? `（支出合共 ${money(total)}）` : ""}：\n` +
+      lines.join("\n") +
+      (plan.skipped ? `\n\n略過 ${plan.skipped} 筆重複` : "") +
+      (plan.invalid ? `\n${plan.invalid} 筆格式唔啱會略過` : "");
+    if (!confirm(msg)) return false;
+    applyMergePlan(plan);
+    touchUpdated(); // bump updatedAt + saveLocal + schedulePush (auto-push if logged in)
+    render();
+    toast(`已加入 ${n} 筆，略過 ${plan.skipped} 筆重複${extra}`, "ok");
+    const cats = [...new Set(plan.tx.filter(isExpense).map((t) => t.category))];
+    cats.forEach((c) => maybeBudgetToast(c));
+    return true;
   }
 
   // ——— Sheet ———
