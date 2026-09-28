@@ -38,6 +38,7 @@
   let tokenClient = null;
   let accessToken = null;
   let gsiReady = false;
+  let leftMonthOffset = 0; // overview 估計剩錢 month selector (0 = this month); UI-only, not saved
 
   // ——— Seed (inline fallback; also loaded from data/seed.json on first run) ———
   const SEED = {
@@ -295,14 +296,118 @@
     return (Number(inst.monthly) || 0) + (Number(inst.fee) || 0);
   }
 
+  function addMonths(mk, n) {
+    const [y, m] = String(mk).split("-").map((x) => parseInt(x, 10));
+    const d = new Date(y, m - 1 + n, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  }
+
+  /** months from a → b (b − a) */
+  function monthDiff(a, b) {
+    const [ay, am] = String(a).split("-").map((x) => parseInt(x, 10));
+    const [by, bm] = String(b).split("-").map((x) => parseInt(x, 10));
+    return by * 12 + bm - (ay * 12 + am);
+  }
+
+  /** Remaining payments (number) or null = ongoing */
+  function instRemaining(i) {
+    if (typeof i.remaining === "number" && !Number.isNaN(i.remaining)) return i.remaining;
+    if (typeof i.remainingPeriods === "number" && !Number.isNaN(i.remainingPeriods)) return i.remainingPeriods;
+    return null;
+  }
+
+  /** Statement override (e.g. enJoy 十月結單) only applies to its own month */
+  function instAmountForMonth(i, mk) {
+    const overrideMonth = i.overrideMonth || "2026-10";
+    if (i.octStatementOverride != null && mk === overrideMonth) return Number(i.octStatementOverride) || 0;
+    return instalmentMonthly(i);
+  }
+
+  /** A recorded expense in month mk that looks like this instalment's payment */
+  function instPaidTx(i, mk) {
+    const amt = instAmountForMonth(i, mk);
+    const name = String(i.name || "").trim();
+    return (data.transactions || []).find((t) => {
+      if (!isExpense(t) || !String(t.date || "").startsWith(mk)) return false;
+      const note = String(t.note || "").trim();
+      if (name && note && (note.includes(name) || (note.length >= 2 && name.includes(note)))) return true;
+      return t.category === "卡數" && Math.abs((Number(t.amount) || 0) - amt) <= 1;
+    });
+  }
+
+  /**
+   * First month of the `remaining` payments.
+   * Saved as i.startMonth (form save / month rollover). For older data without it:
+   * this month if this month's due day hasn't passed and no payment recorded yet, else next month.
+   */
+  function instStartMonth(i) {
+    if (i.startMonth) return String(i.startMonth);
+    const cur = monthKey();
+    const due = Number(i.dueDay) || 0;
+    const today = new Date().getDate();
+    if (!due || (today <= due && !instPaidTx(i, cur))) return cur;
+    return addMonths(cur, 1);
+  }
+
+  /** Is there a payment for this instalment in month mk (mk ≥ this month)? */
+  function instDueInMonth(i, mk) {
+    if (!i || i.active === false) return false;
+    const cur = monthKey();
+    if (monthDiff(cur, mk) < 0) return false;
+    if (i.endMonth && mk > String(i.endMonth)) return false;
+    const R = instRemaining(i);
+    if (R == null) return true; // ongoing
+    if (mk === cur && instPaidTx(i, cur)) return true; // already paid this month → still counts this month
+    if (R <= 0) return false;
+    const start = instStartMonth(i);
+    const k = monthDiff(start, mk);
+    return k >= 0 && k < R;
+  }
+
   function isInstalmentActive(inst) {
     if (!inst || inst.active === false) return false;
-    const rem = inst.remaining != null ? Number(inst.remaining) : null;
-    const remP = inst.remainingPeriods != null ? Number(inst.remainingPeriods) : null;
-    if (rem != null && !Number.isNaN(rem) && rem <= 0) return false;
-    if (remP != null && !Number.isNaN(remP) && remP <= 0) return false;
-    if (inst.endMonth && monthKey() > String(inst.endMonth)) return false;
-    return true;
+    const cur = monthKey();
+    if (inst.endMonth && cur > String(inst.endMonth)) return false;
+    const R = instRemaining(inst);
+    if (R == null) return true;
+    if (instPaidTx(inst, cur)) return true;
+    if (R <= 0) return false;
+    return monthDiff(cur, addMonths(instStartMonth(inst), R - 1)) >= 0;
+  }
+
+  /** Per-month leftover estimate: 實收 − 當月固定 − 當月到期分期 */
+  function monthEstimate(mk) {
+    const cur = monthKey();
+    const income = Number(data.profile.takeHome) || 0;
+    const actualIncome =
+      mk === cur ? monthIncomeTotal() : 0;
+    const subs = (data.subscriptions || [])
+      .filter((x) => x.active !== false && (!x.endMonth || mk <= String(x.endMonth)))
+      .map((x) => ({ id: x.id, name: x.name, amount: Number(x.amount) || 0, dueDay: x.dueDay }));
+    const inst = (data.instalments || [])
+      .filter((i) => instDueInMonth(i, mk))
+      .map((i) => {
+        const R = instRemaining(i);
+        const amount = instAmountForMonth(i, mk);
+        const isOverride = amount !== instalmentMonthly(i);
+        let last = false;
+        if (R != null && R > 0) last = monthDiff(instStartMonth(i), mk) === R - 1;
+        if (i.endMonth && mk === String(i.endMonth)) last = true;
+        return {
+          id: i.id,
+          name: i.name,
+          amount,
+          dueDay: i.dueDay,
+          override: isOverride,
+          last,
+          paid: mk === cur && !!instPaidTx(i, mk),
+          pending: !!i.pendingConfirm,
+        };
+      });
+    const subsTotal = subs.reduce((s, x) => s + x.amount, 0);
+    const instTotal = inst.reduce((s, x) => s + x.amount, 0);
+    const left = income - subsTotal - instTotal;
+    return { month: mk, income, actualIncome, subs, inst, subsTotal, instTotal, fixed: subsTotal + instTotal, left };
   }
 
   function activeInstalments() {
@@ -370,21 +475,22 @@
       data.monthHistory = data.monthHistory.slice(-36);
     }
 
-    // Tick instalments for the new month
+    // Tick instalments for the new month.
+    // `remaining` = payments from startMonth onward. Legacy items (no startMonth) are treated as
+    // starting the month after `last` (last month's payment already done). Only months that have
+    // passed since startMonth are deducted, so a final payment due this month still counts.
     (data.instalments || []).forEach((i) => {
-      if (typeof i.remaining === "number" && !Number.isNaN(i.remaining)) {
-        i.remaining = Math.max(0, i.remaining - 1);
-      }
-      if (typeof i.remainingPeriods === "number" && !Number.isNaN(i.remainingPeriods)) {
-        i.remainingPeriods = Math.max(0, i.remainingPeriods - 1);
+      const R = instRemaining(i);
+      if (R != null) {
+        const start = i.startMonth ? String(i.startMonth) : addMonths(last, 1);
+        const passed = Math.max(0, monthDiff(start, current));
+        const nr = Math.max(0, R - passed);
+        if (typeof i.remaining === "number" && !Number.isNaN(i.remaining)) i.remaining = nr;
+        if (typeof i.remainingPeriods === "number" && !Number.isNaN(i.remainingPeriods)) i.remainingPeriods = nr;
+        i.startMonth = passed > 0 ? current : start;
+        if (nr <= 0) i.active = false;
       }
       if (i.endMonth && current > String(i.endMonth)) {
-        i.active = false;
-      }
-      if (
-        (typeof i.remaining === "number" && i.remaining <= 0) ||
-        (typeof i.remainingPeriods === "number" && i.remainingPeriods <= 0)
-      ) {
         i.active = false;
       }
       // Keep octStatementOverride only during 2026-10; clear otherwise
@@ -407,13 +513,11 @@
       }
     });
 
-    const expectedItems = [];
-    (data.subscriptions || []).forEach((s) => {
-      expectedItems.push({ kind: "固定", name: s.name, amount: Number(s.amount) || 0 });
-    });
-    activeInstalments().forEach((i) => {
-      expectedItems.push({ kind: "卡數", name: i.name, amount: instalmentMonthly(i) });
-    });
+    const est = monthEstimate(current);
+    const expectedItems = [
+      ...est.subs.map((x) => ({ kind: "固定", name: x.name, amount: x.amount })),
+      ...est.inst.map((x) => ({ kind: "卡數", name: x.name, amount: x.amount })),
+    ];
     const expectedTotal = expectedItems.reduce((s, x) => s + (Number(x.amount) || 0), 0);
 
     data.lastMonthKey = current;
@@ -466,12 +570,11 @@
 
 
   function monthlyFixed() {
-    return sumSubs() + sumInstalments();
+    return monthEstimate(monthKey()).fixed;
   }
 
   function leftover() {
-    const take = Number(data.profile.takeHome) || 0;
-    return take - monthlyFixed();
+    return monthEstimate(monthKey()).left;
   }
 
   function monthKey(d = new Date()) {
@@ -586,10 +689,70 @@
     else if (!navigator.onLine) dot.classList.add("warn");
   }
 
+  function monthTitle(mk) {
+    const [y, m] = String(mk).split("-").map((x) => parseInt(x, 10));
+    const cy = new Date().getFullYear();
+    return y === cy ? `${m} 月` : `${y}年${m}月`;
+  }
+
+  function renderLeftoverCard(cap) {
+    const cur = monthKey();
+    const mk = addMonths(cur, leftMonthOffset);
+    const e = monthEstimate(mk);
+    const afterCap = e.left - cap;
+    const chips = [0, 1, 2, 3, 4, 5]
+      .map((o) => {
+        const m = addMonths(cur, o);
+        const [y, mm] = m.split("-").map((x) => parseInt(x, 10));
+        const yr = y !== new Date().getFullYear() ? `<span class="chip-yr">${String(y).slice(2)}</span>` : "";
+        return `<button type="button" class="chip month-opt ${o === leftMonthOffset ? "active" : ""}" data-left-offset="${o}" aria-label="${y}年${mm}月">${mm}月${yr}</button>`;
+      })
+      .join("");
+    const row = (title, sub, amt, cls = "") =>
+      `<li class="list-item ${cls}"><div class="meta"><div class="title">${title}</div>${sub ? `<div class="sub">${sub}</div>` : ""}</div><div class="amt">${amt}</div></li>`;
+    const subRows = e.subs.length
+      ? e.subs.map((x) => row(esc(x.name), x.dueDay ? `${esc(x.dueDay)} 號` : "", "−" + money(x.amount))).join("")
+      : row('<span class="sub">冇</span>', "", "");
+    const instRows = e.inst.length
+      ? e.inst
+          .map((x) => {
+            const tags =
+              (x.override ? '<span class="tag">結單金額</span>' : "") +
+              (x.last ? '<span class="tag muted">最後一期</span>' : "") +
+              (x.paid ? '<span class="tag muted">已記帳</span>' : "") +
+              (x.pending ? '<span class="tag">待確認</span>' : "");
+            return row(`${esc(x.name)}${tags}`, x.dueDay ? `${esc(x.dueDay)} 號` : "", "−" + money(x.amount));
+          })
+          .join("")
+      : row('<span class="sub">冇</span>', "", "");
+    return `
+      <div class="card left-card">
+        <div class="chips month-chips" role="tablist" aria-label="揀月份">${chips}</div>
+        <h2>估計 ${esc(monthTitle(mk))}剩錢</h2>
+        <div class="hero-amount ${e.left >= 0 ? "positive" : "negative"}">${money(e.left)}</div>
+        <div class="hero-sub">實收 ${money(e.income)} − 固定 ${money(e.subsTotal)} − 分期／卡數 ${money(e.instTotal)}</div>
+        <div class="hero-sub">扣埋開支目標 ${money(cap)} 後：<strong class="${afterCap >= 0 ? "pos-text" : "neg-text"}">${money(afterCap)}</strong></div>
+        <details class="breakdown" id="leftDetails">
+          <summary>睇計算明細</summary>
+          <div class="bd-head"><span>收入</span><span>${money(e.income)}</span></div>
+          <ul class="list">
+            ${row("實收薪金（預計）", "", money(e.income))}
+            ${mk === cur && e.actualIncome ? row('<span class="sub">本月已入帳</span>', "", `<span class="sub">${money(e.actualIncome)}</span>`) : ""}
+          </ul>
+          <div class="bd-head"><span>固定開支</span><span>−${money(e.subsTotal)}</span></div>
+          <ul class="list">${subRows}</ul>
+          <div class="bd-head"><span>分期／卡數</span><span>−${money(e.instTotal)}</span></div>
+          <ul class="list">${instRows}</ul>
+          <div class="bd-head bd-total"><span>剩錢</span><span>${money(e.left)}</span></div>
+          <p class="hero-sub bd-note">計法：實收 − 當月固定 − 當月到期分期（未計日常開支）。分期按「剩餘期數」逐月計，完咗就唔再計；結單金額（例如十月結單）只計嗰個月。</p>
+        </details>
+      </div>`;
+  }
+
   function renderOverview() {
     const el = $("#view-overview");
-    const left = leftover();
-    const fixed = monthlyFixed();
+    const curEst = monthEstimate(monthKey());
+    const fixed = curEst.fixed;
     const cap = Number(data.profile.monthlyCap) || 8000;
     const room = cap - fixed; // often negative if fixed > cap — show discretionary room under 8000
     // Interpreting prior advice: room under 8000 for discretionary = cap - fixed (can be negative)
@@ -604,12 +767,7 @@
     const incomeMonth = monthIncomeTotal();
     const budgets = (data.profile && data.profile.categoryBudgets) || {};
 
-    const octNotes = activeInstalments().filter((i) => i.octStatementOverride);
-    const octHtml = octNotes.length
-      ? `<div class="note-box">十月結單提示：${octNotes
-          .map((i) => `${esc(i.name)} 約 ${money(i.octStatementOverride)}（含分期）`)
-          .join("；")}</div>`
-      : "";
+    const leftHtml = renderLeftoverCard(cap);
 
     const budgetRows = BUDGET_CATS.filter((c) => Number(budgets[c]) > 0)
       .map((c) => {
@@ -630,12 +788,7 @@
 
     el.innerHTML = `
       <div class="month-chip">本月 ${esc(mk)}</div>
-      <div class="card">
-        <h2>估計每月剩錢</h2>
-        <div class="hero-amount ${left >= 0 ? "positive" : "negative"}">${money(left)}</div>
-        <div class="hero-sub">實收 ${money(take)} − 固定 ${money(sumSubs())} − 卡數分期 ${money(sumInstalments())}</div>
-        ${octHtml}
-      </div>
+      ${leftHtml}
 
       <div class="card payroll-card">
         <h2>出糧入帳</h2>
@@ -709,6 +862,14 @@
 
     const btnPay = $("#btnPayroll");
     if (btnPay) btnPay.onclick = () => openPayrollSheet();
+    $$("[data-left-offset]").forEach((b) => {
+      b.onclick = () => {
+        leftMonthOffset = parseInt(b.dataset.leftOffset, 10) || 0;
+        const open = !!($("#leftDetails") && $("#leftDetails").open);
+        renderOverview();
+        if (open && $("#leftDetails")) $("#leftDetails").open = true;
+      };
+    });
   }
 
   function openPayrollSheet() {
@@ -1280,6 +1441,14 @@
         dueDay: parseInt($("#iDue").value, 10) || null,
         pendingConfirm: $("#iPend").checked,
       };
+      const remChanged = !existing || existing.remaining !== payload.remaining || existing.dueDay !== payload.dueDay;
+      if (payload.remaining != null && (remChanged || !existing.startMonth)) {
+        // 剩餘期數 = unpaid payments from now: this month if its due day hasn't passed yet, else next month
+        const cur = monthKey();
+        const due = payload.dueDay || 0;
+        payload.startMonth = !due || new Date().getDate() <= due ? cur : addMonths(cur, 1);
+        if (existing) delete existing.active;
+      }
       if (existing) Object.assign(existing, payload);
       else data.instalments.push(Object.assign({ id: uid("inst") }, payload));
       touchUpdated();
