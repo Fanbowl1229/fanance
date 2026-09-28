@@ -316,7 +316,7 @@
     return null;
   }
 
-  /** Statement override (e.g. enJoy 十月結單) only applies to its own month */
+  /** Statement override (e.g. 十月結單) only applies to its own month */
   function instAmountForMonth(i, mk) {
     const overrideMonth = i.overrideMonth || "2026-10";
     if (i.octStatementOverride != null && mk === overrideMonth) return Number(i.octStatementOverride) || 0;
