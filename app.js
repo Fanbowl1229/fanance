@@ -7,6 +7,8 @@
   const META_KEY = "fanance-meta-v1";
   const CATEGORIES = ["飲食", "交通", "購物", "娛樂", "固定", "卡數", "其他"];
   const INCOME_CATEGORY = "收入";
+  const MEAL_CATEGORY = "飲食";
+  const MEAL_SUBS = ["早餐", "午餐", "晚餐", "其他"];
   const BUDGET_CATS = ["飲食", "交通", "購物", "娛樂", "其他"];
   const DEFAULT_CATEGORY_BUDGETS = {
     "飲食": 2500,
@@ -929,6 +931,16 @@
     };
   }
 
+  function mealSummaryHtml() {
+    const { out, total } = mealBreakdownThisMonth();
+    if (!total) return "";
+    const parts = ["早餐", "午餐", "晚餐", "其他", "未分"]
+      .filter((k) => out[k] > 0)
+      .map((k) => `<span class="meal-pill"><b>${k === "未分" ? "未分類" : k}</b> ${money(out[k])}</span>`)
+      .join("");
+    return `<div class="meal-summary" aria-label="本月飲食分佈"><span class="meal-summary-title">本月飲食 ${money(total)}</span>${parts}</div>`;
+  }
+
   function renderLedger() {
     const el = $("#view-ledger");
     const txs = [...(data.transactions || [])].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
@@ -953,6 +965,7 @@
             ${CATEGORIES.map((c, i) => `<button type="button" class="chip ${i === 0 ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`).join("")}
           </div>
         </div>
+        ${mealRowHtml("txMealRow", "", CATEGORIES[0] === MEAL_CATEGORY)}
         <div class="form-row">
           <label>戶口</label>
           <div class="chips" id="accChips">
@@ -970,6 +983,7 @@
         <button type="button" class="btn btn-primary" id="btnAddTx">記一筆</button>
       </div>
 
+      ${mealSummaryHtml()}
       <div class="section-title"><span>最近交易</span><span>${txs.length} 筆</span></div>
       <div class="card" style="padding:4px 12px">
         ${
@@ -983,7 +997,7 @@
                   return `
               <li class="list-item" data-id="${esc(t.id)}">
                 <div class="meta">
-                  <div class="title">${esc(t.category)}${t.note ? " · " + esc(t.note) : ""}</div>
+                  <div class="title">${esc(txCategoryLabel(t))}${t.note && t.note !== t.sub ? " · " + esc(t.note) : ""}</div>
                   <div class="sub">${esc(t.date)} · ${esc(t.account)} · ${typeTag}</div>
                 </div>
                 <div class="${amtCls}">${amtTxt}</div>
@@ -1038,6 +1052,7 @@
         syncTypeUI();
       };
     }
+    wireMealChips("#txMealRow", "#catRow", "#txNote", "#typeChips");
     $("#btnAddTx").onclick = () => addTransaction();
     $$("[data-del-tx]").forEach((b) => (b.onclick = () => deleteTx(b.dataset.delTx)));
     $$("[data-edit-tx]").forEach((b) => (b.onclick = () => openEditTx(b.dataset.editTx)));
@@ -1059,6 +1074,93 @@
     return a ? a.dataset.val : "";
   }
 
+  // ——— 飲食 subcategory (早餐／午餐／晚餐／其他) ———
+  function mealRowHtml(rowId, selected, visible) {
+    return `<div class="form-row meal-row" id="${rowId}" ${visible ? "" : "hidden"}>
+          <label>餐別（可選）</label>
+          <div class="chips meal-chips" role="radiogroup" aria-label="餐別">${MEAL_SUBS.map(
+            (m) =>
+              `<button type="button" class="chip ${m === selected ? "active" : ""}" data-meal="${esc(m)}" role="radio" aria-checked="${m === selected}">${esc(m)}</button>`
+          ).join("")}</div>
+        </div>`;
+  }
+
+  function mealValue(rowSel) {
+    const row = $(rowSel);
+    if (!row || row.hidden) return "";
+    const a = $(".chip.active", row);
+    return a ? a.dataset.meal : "";
+  }
+
+  /**
+   * Wire meal chips: single-select, tap again to deselect.
+   * Prefills note only when empty (or still holding the previous auto-filled label).
+   * Shows the row only while catRowSel's active chip is 飲食.
+   */
+  function wireMealChips(rowSel, catRowSel, noteSel, typeSel) {
+    const row = $(rowSel);
+    const catRow = $(catRowSel);
+    if (!row || !catRow) return;
+    const note = $(noteSel);
+    const isMealLabel = (v) => MEAL_SUBS.includes(String(v || "").trim());
+    row.onclick = (e) => {
+      const btn = e.target.closest(".chip[data-meal]");
+      if (!btn) return;
+      const was = btn.classList.contains("active");
+      $$(".chip", row).forEach((c) => {
+        c.classList.remove("active");
+        c.setAttribute("aria-checked", "false");
+      });
+      if (!was) {
+        btn.classList.add("active");
+        btn.setAttribute("aria-checked", "true");
+      }
+      if (note) {
+        const cur = note.value.trim();
+        if (!was && (!cur || (isMealLabel(cur) && note.dataset.autoMeal === cur))) {
+          note.value = btn.dataset.meal;
+          note.dataset.autoMeal = btn.dataset.meal;
+        } else if (was && cur && note.dataset.autoMeal === cur) {
+          note.value = "";
+          delete note.dataset.autoMeal;
+        }
+      }
+    };
+    const sync = () => {
+      const typ = typeSel ? chipValue(typeSel) || "expense" : "expense";
+      const a = $(".chip.active", catRow);
+      const show = typ !== "income" && !!a && a.dataset.val === MEAL_CATEGORY;
+      row.hidden = !show;
+      if (!show && note && note.dataset.autoMeal && note.value.trim() === note.dataset.autoMeal) {
+        note.value = ""; // drop auto-filled meal label when leaving 飲食
+        delete note.dataset.autoMeal;
+      }
+    };
+    // catRow persists while its chips get re-rendered → listen on the row (capture runs after chip wiring via microtask)
+    catRow.addEventListener("click", () => setTimeout(sync, 0));
+    if (typeSel && $(typeSel)) $(typeSel).addEventListener("click", () => setTimeout(sync, 0));
+    sync();
+  }
+
+  function txCategoryLabel(t) {
+    return t.sub && !isIncome(t) ? `${t.category}・${t.sub}` : t.category;
+  }
+
+  function mealBreakdownThisMonth() {
+    const out = { 早餐: 0, 午餐: 0, 晚餐: 0, 其他: 0, 未分: 0 };
+    let total = 0;
+    (data.transactions || [])
+      .filter((t) => isExpense(t) && t.category === MEAL_CATEGORY && isCurrentMonth(t.date))
+      .forEach((t) => {
+        const a = Number(t.amount) || 0;
+        total += a;
+        if (!t.sub) out["未分"] += a;
+        else if (out[t.sub] != null && t.sub !== "未分") out[t.sub] += a;
+        else out["其他"] += a;
+      });
+    return { out, total };
+  }
+
   function addTransaction() {
     const amount = parseFloat($("#txAmount").value);
     if (!amount || amount <= 0) {
@@ -1076,6 +1178,8 @@
       note: ($("#txNote").value || "").trim(),
       type: isInc ? "income" : "expense",
     };
+    const meal = !isInc && tx.category === MEAL_CATEGORY ? mealValue("#txMealRow") : "";
+    if (meal) tx.sub = meal;
     data.transactions.push(tx);
     if (isInc) {
       adjustAccountBalance(tx.account, amount);
@@ -1123,6 +1227,7 @@
       <div class="form-row" id="eCatRow"><label>類別</label>
         <div class="chips" id="eCat">${catChips}</div>
       </div>
+      ${mealRowHtml("eMealRow", t.sub || "", !wasInc && t.category === MEAL_CATEGORY)}
       <div class="form-row"><label>戶口</label>
         <div class="chips" id="eAcc">${accountNames().map((c) => `<button type="button" class="chip ${c === t.account ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`).join("")}</div>
       </div>
@@ -1136,6 +1241,7 @@
     wireChips("#eType");
     wireChips("#eCat");
     wireChips("#eAcc");
+    if (t.sub && t.note === t.sub) $("#eNote").dataset.autoMeal = t.sub;
     const eType = $("#eType");
     if (eType) {
       eType.onclick = (e) => {
@@ -1158,6 +1264,7 @@
         wireChips("#eCat");
       };
     }
+    wireMealChips("#eMealRow", "#eCatRow", "#eNote", "#eType");
     $("#eCancel").onclick = closeSheet;
     $("#eSave").onclick = () => {
       const prevAmt = Number(t.amount) || 0;
@@ -1172,6 +1279,9 @@
       t.account = newAcc;
       t.date = $("#eDate").value || t.date;
       t.note = ($("#eNote").value || "").trim();
+      const newMeal = !newInc && t.category === MEAL_CATEGORY ? mealValue("#eMealRow") : "";
+      if (newMeal) t.sub = newMeal;
+      else delete t.sub;
       t.type = newInc ? "income" : "expense";
       // Rebalance accounts if income side changed
       if (prevInc) adjustAccountBalance(prevAcc, -prevAmt);
@@ -1721,6 +1831,10 @@
       account: accNames.has(acc) ? acc : "其他",
       note: String(t.note == null ? "" : t.note).trim(),
       type: isInc ? "income" : "expense",
+      ...(() => {
+        const sub = String(t.sub == null ? "" : t.sub).trim().slice(0, 20);
+        return sub && !isInc ? { sub } : {};
+      })(),
     };
   }
 
@@ -1818,7 +1932,7 @@
     }
     const lines = plan.tx
       .slice(0, 12)
-      .map((t) => `${t.date} ${t.type === "income" ? "收入" : t.category} ${money(t.amount)}${t.note ? " " + t.note : ""}`);
+      .map((t) => `${t.date} ${t.type === "income" ? "收入" : txCategoryLabel(t)} ${money(t.amount)}${t.note && t.note !== t.sub ? " " + t.note : ""}`);
     if (plan.tx.length > 12) lines.push(`…（仲有 ${plan.tx.length - 12} 筆）`);
     plan.subs.forEach((x) => lines.push(`固定：${x.name} ${money(x.amount)}`));
     plan.inst.forEach((x) => lines.push(`卡數分期：${x.name}`));

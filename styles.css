@@ -679,3 +679,23 @@ a {
 }
 .breakdown .list-item { padding-top: 6px; padding-bottom: 6px; min-height: 0; }
 .bd-note { margin-top: 8px; font-size: 0.75rem; }
+
+/* 飲食 餐別 chips + monthly summary */
+.meal-row[hidden] { display: none; }
+.meal-chips .chip { min-height: 36px; padding: 6px 14px; }
+.meal-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 14px 4px 0;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+.meal-summary-title { font-weight: 600; margin-right: 2px; }
+.meal-pill {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--bg-soft);
+}
+.meal-pill b { font-weight: 600; color: var(--text); }
