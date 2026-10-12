@@ -1,5 +1,5 @@
 /* Fanance shell cache — offline-friendly */
-const CACHE = "fanance-shell-v8";
+const CACHE = "fanance-shell-v9";
 const ASSETS = [
   "./",
   "./index.html",

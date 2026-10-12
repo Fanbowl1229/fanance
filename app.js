@@ -378,11 +378,19 @@
   }
 
   /** Per-month leftover estimate: 實收 − 當月固定 − 當月到期分期 */
+  /**
+   * Per-month leftover:
+   *   takeHome − subscriptions due − instalments due − recorded "other" expenses.
+   * Other expenses = expense txs that month whose category is NOT 固定／卡數
+   * (those two are already covered by the fixed/instalment lines, so excluded to avoid double-count).
+   * Future months with no txs → otherSpend = 0 (pure forecast).
+   */
   function monthEstimate(mk) {
     const cur = monthKey();
     const income = Number(data.profile.takeHome) || 0;
-    const actualIncome =
-      mk === cur ? monthIncomeTotal() : 0;
+    const actualIncome = (data.transactions || [])
+      .filter((t) => isIncome(t) && String(t.date || "").startsWith(mk))
+      .reduce((s, t) => s + (Number(t.amount) || 0), 0);
     const subs = (data.subscriptions || [])
       .filter((x) => x.active !== false && (!x.endMonth || mk <= String(x.endMonth)))
       .map((x) => ({ id: x.id, name: x.name, amount: Number(x.amount) || 0, dueDay: x.dueDay }));
@@ -406,10 +414,33 @@
           pending: !!i.pendingConfirm,
         };
       });
+    const FIXED_CATS = new Set(["固定", "卡數"]);
+    const otherTx = (data.transactions || []).filter((t) => {
+      if (!isExpense(t)) return false;
+      if (!String(t.date || "").startsWith(mk)) return false;
+      if (FIXED_CATS.has(t.category)) return false;
+      return true;
+    });
+    const otherSpend = otherTx.reduce((s, t) => s + (Number(t.amount) || 0), 0);
+    const otherCount = otherTx.length;
     const subsTotal = subs.reduce((s, x) => s + x.amount, 0);
     const instTotal = inst.reduce((s, x) => s + x.amount, 0);
-    const left = income - subsTotal - instTotal;
-    return { month: mk, income, actualIncome, subs, inst, subsTotal, instTotal, fixed: subsTotal + instTotal, left };
+    const forecast = income - subsTotal - instTotal; // before recorded daily spend
+    const left = forecast - otherSpend;
+    return {
+      month: mk,
+      income,
+      actualIncome,
+      subs,
+      inst,
+      subsTotal,
+      instTotal,
+      otherSpend,
+      otherCount,
+      forecast,
+      fixed: subsTotal + instTotal,
+      left,
+    };
   }
 
   function activeInstalments() {
@@ -702,6 +733,7 @@
     const mk = addMonths(cur, leftMonthOffset);
     const e = monthEstimate(mk);
     const afterCap = e.left - cap;
+    const hasSpend = e.otherCount > 0;
     const chips = [0, 1, 2, 3, 4, 5]
       .map((o) => {
         const m = addMonths(cur, o);
@@ -727,26 +759,51 @@
           })
           .join("")
       : row('<span class="sub">冇</span>', "", "");
+    const spendLine = hasSpend
+      ? ` − 已記開支 ${money(e.otherSpend)}`
+      : "";
+    const reflectedTag = hasSpend
+      ? `<span class="tag muted reflected-tag">已反映記帳</span>`
+      : `<span class="tag muted reflected-tag">預測</span>`;
+    const incomeNote =
+      e.actualIncome > 0 && Math.abs(e.actualIncome - e.income) > 0.5
+        ? row('<span class="sub">本月已入帳收入</span>', "參考；剩錢仍用預計實收計", `<span class="sub">${money(e.actualIncome)}</span>`)
+        : e.actualIncome > 0
+          ? row('<span class="sub">本月已入帳</span>', "", `<span class="sub">${money(e.actualIncome)}</span>`)
+          : "";
     return `
       <div class="card left-card">
         <div class="chips month-chips" role="tablist" aria-label="揀月份">${chips}</div>
-        <h2>估計 ${esc(monthTitle(mk))}剩錢</h2>
+        <h2>估計 ${esc(monthTitle(mk))}剩錢 ${reflectedTag}</h2>
         <div class="hero-amount ${e.left >= 0 ? "positive" : "negative"}">${money(e.left)}</div>
-        <div class="hero-sub">實收 ${money(e.income)} − 固定 ${money(e.subsTotal)} − 分期／卡數 ${money(e.instTotal)}</div>
+        <div class="hero-sub">實收 ${money(e.income)} − 固定 ${money(e.subsTotal)} − 分期／卡數 ${money(e.instTotal)}${spendLine}</div>
+        ${
+          hasSpend
+            ? `<div class="hero-sub">未計日常開支前：${money(e.forecast)}</div>`
+            : ""
+        }
         <div class="hero-sub">扣埋開支目標 ${money(cap)} 後：<strong class="${afterCap >= 0 ? "pos-text" : "neg-text"}">${money(afterCap)}</strong></div>
         <details class="breakdown" id="leftDetails">
           <summary>睇計算明細</summary>
           <div class="bd-head"><span>收入</span><span>${money(e.income)}</span></div>
           <ul class="list">
             ${row("實收薪金（預計）", "", money(e.income))}
-            ${mk === cur && e.actualIncome ? row('<span class="sub">本月已入帳</span>', "", `<span class="sub">${money(e.actualIncome)}</span>`) : ""}
+            ${incomeNote}
           </ul>
           <div class="bd-head"><span>固定開支</span><span>−${money(e.subsTotal)}</span></div>
           <ul class="list">${subRows}</ul>
           <div class="bd-head"><span>分期／卡數</span><span>−${money(e.instTotal)}</span></div>
           <ul class="list">${instRows}</ul>
+          <div class="bd-head"><span>本月已記開支</span><span>−${money(e.otherSpend)}</span></div>
+          <ul class="list">
+            ${
+              hasSpend
+                ? row(`${e.otherCount} 筆日常開支`, "唔計「固定／卡數」類（避免重複）", "−" + money(e.otherSpend))
+                : row('<span class="sub">未有記帳（預測）</span>', "", "−" + money(0))
+            }
+          </ul>
           <div class="bd-head bd-total"><span>剩錢</span><span>${money(e.left)}</span></div>
-          <p class="hero-sub bd-note">計法：實收 − 當月固定 − 當月到期分期（未計日常開支）。分期按「剩餘期數」逐月計，完咗就唔再計；結單金額（例如十月結單）只計嗰個月。</p>
+          <p class="hero-sub bd-note">計法：實收 − 當月固定 − 當月到期分期 − 已記日常開支。日常開支＝該月記帳入面唔屬「固定／卡數」嘅支出（免同上面重複）。未來月份未記帳＝只計固定同分期。分期按「剩餘期數」逐月計；結單金額只計嗰個月。</p>
         </details>
       </div>`;
   }
