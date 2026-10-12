@@ -722,6 +722,69 @@
     else if (!navigator.onLine) dot.classList.add("warn");
   }
 
+  /** Expense totals by category for month mk (income skipped). */
+  function monthCategoryTotals(mk) {
+    const by = {};
+    CATEGORIES.forEach((c) => {
+      by[c] = 0;
+    });
+    const extras = {};
+    const mealBy = {};
+    MEAL_SUBS.forEach((m) => {
+      mealBy[m] = 0;
+    });
+    mealBy["未分"] = 0;
+    let total = 0;
+    (data.transactions || []).forEach((t) => {
+      if (!isExpense(t)) return;
+      if (!String(t.date || "").startsWith(mk)) return;
+      const amt = Number(t.amount) || 0;
+      const cat = String(t.category || "其他").trim() || "其他";
+      total += amt;
+      if (Object.prototype.hasOwnProperty.call(by, cat)) by[cat] += amt;
+      else extras[cat] = (extras[cat] || 0) + amt;
+      if (cat === MEAL_CATEGORY) {
+        const sub = String(t.sub || "").trim();
+        if (sub && Object.prototype.hasOwnProperty.call(mealBy, sub)) mealBy[sub] += amt;
+        else if (sub) mealBy[sub] = (mealBy[sub] || 0) + amt;
+        else mealBy["未分"] += amt;
+      }
+    });
+    const unknown = Object.keys(extras).sort();
+    return { by, extras, unknown, mealBy, total };
+  }
+
+  function renderCategoryCard(mk) {
+    const { by, extras, unknown, mealBy, total } = monthCategoryTotals(mk);
+    const row = (title, sub, amt, cls = "") =>
+      `<li class="list-item ${cls}"><div class="meta"><div class="title">${title}</div>${
+        sub ? `<div class="sub">${sub}</div>` : ""
+      }</div><div class="amt">${amt}</div></li>`;
+    const mealParts = Object.keys(mealBy)
+      .filter((k) => mealBy[k] > 0)
+      .map((k) => `${k === "未分" ? "未分類" : k} ${money(mealBy[k])}`)
+      .join(" · ");
+    const mealSub = by[MEAL_CATEGORY] > 0 && mealParts ? mealParts : "";
+    const knownRows = CATEGORIES.map((c) => {
+      const sub = c === MEAL_CATEGORY ? mealSub : "";
+      return row(esc(c), sub, money(by[c] || 0));
+    }).join("");
+    const extraRows = unknown.map((c) => row(esc(c), "", money(extras[c]))).join("");
+    return `
+      <div class="card cat-totals-card">
+        <h2>${esc(monthTitle(mk))}分類開支</h2>
+        <div class="hero-sub" style="margin-bottom:6px">跟上面剩錢同一個月份 · 只計支出記帳</div>
+        <ul class="list cat-totals-list">
+          ${knownRows}
+          ${extraRows}
+          <li class="list-item cat-total-row">
+            <div class="meta"><div class="title">合計</div></div>
+            <div class="amt">${money(total)}</div>
+          </li>
+        </ul>
+      </div>`;
+  }
+
   function monthTitle(mk) {
     const [y, m] = String(mk).split("-").map((x) => parseInt(x, 10));
     const cy = new Date().getFullYear();
@@ -848,6 +911,7 @@
     el.innerHTML = `
       <div class="month-chip">本月 ${esc(mk)}</div>
       ${leftHtml}
+      ${renderCategoryCard(addMonths(mk, leftMonthOffset))}
 
       <div class="card payroll-card">
         <h2>出糧入帳</h2>
