@@ -708,3 +708,18 @@ a {
   font-weight: 700;
 }
 .cat-total-row .title { font-weight: 700; }
+
+/* 已還 toggle */
+.btn-paid {
+  min-height: 32px;
+  padding: 4px 10px;
+  font-size: 0.78rem;
+  border: 1.5px solid var(--border);
+  white-space: nowrap;
+}
+.btn-paid.is-paid {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-bright);
+}
+.list-actions .btn-paid { margin-right: 2px; }

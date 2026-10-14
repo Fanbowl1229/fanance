@@ -5,16 +5,18 @@
 
   const STORAGE_KEY = "fanance-data-v1";
   const META_KEY = "fanance-meta-v1";
-  const CATEGORIES = ["飲食", "交通", "購物", "娛樂", "固定", "卡數", "其他"];
+  const CATEGORIES = ["飲食", "咖啡", "交通", "購物", "娛樂", "寵物", "固定", "卡數", "其他"];
   const INCOME_CATEGORY = "收入";
   const MEAL_CATEGORY = "飲食";
   const MEAL_SUBS = ["早餐", "午餐", "晚餐", "其他"];
-  const BUDGET_CATS = ["飲食", "交通", "購物", "娛樂", "其他"];
+  const BUDGET_CATS = ["飲食", "咖啡", "交通", "購物", "娛樂", "寵物", "其他"];
   const DEFAULT_CATEGORY_BUDGETS = {
     "飲食": 2500,
+    "咖啡": 400,
     "交通": 900,
     "購物": 1500,
     "娛樂": 800,
+    "寵物": 500,
     "其他": 800,
   };
   const ACCOUNT_NAMES = ["現金", "其他"]; // generic fallbacks; real account names come from data.accounts
@@ -55,9 +57,11 @@
       "name": "Fanance",
       "categoryBudgets": {
         "飲食": 2500,
+        "咖啡": 400,
         "交通": 900,
         "購物": 1500,
         "娛樂": 800,
+        "寵物": 500,
         "其他": 800
       }
     },
@@ -237,11 +241,18 @@
   /** Once: seed default categoryBudgets if missing; never wipe user edits */
   function ensureCategoryBudgets() {
     if (!data || !data.profile) return false;
+    let changed = false;
     if (!data.profile.categoryBudgets || typeof data.profile.categoryBudgets !== "object") {
       data.profile.categoryBudgets = Object.assign({}, DEFAULT_CATEGORY_BUDGETS);
       return true;
     }
-    return false;
+    BUDGET_CATS.forEach((c) => {
+      if (data.profile.categoryBudgets[c] == null && DEFAULT_CATEGORY_BUDGETS[c] != null) {
+        data.profile.categoryBudgets[c] = DEFAULT_CATEGORY_BUDGETS[c];
+        changed = true;
+      }
+    });
+    return changed;
   }
 
   function migrateData() {
@@ -290,8 +301,11 @@
   }
 
   // ——— Calculations ———
-  function sumSubs() {
-    return (data.subscriptions || []).reduce((s, x) => s + (Number(x.amount) || 0), 0);
+  function sumSubs(mk) {
+    const m = mk || monthKey();
+    return (data.subscriptions || [])
+      .filter((x) => subDueInMonth(x, m) && !isPaidForMonth(x, m))
+      .reduce((s, x) => s + (Number(x.amount) || 0), 0);
   }
 
   function instalmentMonthly(inst) {
@@ -311,7 +325,63 @@
     return by * 12 + bm - (ay * 12 + am);
   }
 
-  /** Remaining payments (number) or null = ongoing */
+  // ——— paidMonths + subscription frequency ———
+  function paidMonthsOf(item) {
+    return Array.isArray(item && item.paidMonths) ? item.paidMonths.map(String) : [];
+  }
+
+  function isPaidForMonth(item, mk) {
+    return paidMonthsOf(item).includes(String(mk));
+  }
+
+  function togglePaidMonth(item, mk) {
+    if (!item) return false;
+    const key = String(mk);
+    const list = paidMonthsOf(item).slice();
+    const idx = list.indexOf(key);
+    if (idx >= 0) list.splice(idx, 1);
+    else list.push(key);
+    list.sort();
+    item.paidMonths = list;
+    return idx < 0; // true = now paid
+  }
+
+  function subFrequency(s) {
+    const f = s && s.frequency;
+    return f === "bimonthly" || f === "bi-monthly" || f === "every2months" ? "bimonthly" : "monthly";
+  }
+
+  /** Subscription due in month mk? (respects bimonthly startMonth) */
+  function subDueInMonth(s, mk) {
+    if (!s || s.active === false) return false;
+    if (s.endMonth && mk > String(s.endMonth)) return false;
+    if (subFrequency(s) !== "bimonthly") return true;
+    const start = String(s.startMonth || s.nextDueMonth || "").trim();
+    if (!/^\d{4}-\d{2}$/.test(start)) return true; // incomplete data → treat as monthly
+    if (mk < start) return false;
+    return monthDiff(start, mk) % 2 === 0;
+  }
+
+  function offerRecordPayment(kind, item, mk, amount) {
+    const label = kind === "卡數" ? "分期／卡數" : "固定";
+    if (!confirm(`已標「已還」。要唔要同時記一筆「${label}」支出 ${money(amount)}？`)) return;
+    const day = Math.min(Number(item.dueDay) || 1, 28);
+    const date = `${mk}-${String(day).padStart(2, "0")}`;
+    const tx = {
+      id: uid("tx"),
+      date,
+      amount: Number(amount) || 0,
+      category: kind,
+      account: "其他",
+      note: String(item.name || "").trim() || label,
+      type: "expense",
+    };
+    if (!data.transactions) data.transactions = [];
+    data.transactions.push(tx);
+    toast(`已記帳 ${money(tx.amount)}`, "ok");
+  }
+
+    /** Remaining payments (number) or null = ongoing */
   function instRemaining(i) {
     if (typeof i.remaining === "number" && !Number.isNaN(i.remaining)) return i.remaining;
     if (typeof i.remainingPeriods === "number" && !Number.isNaN(i.remainingPeriods)) return i.remainingPeriods;
@@ -391,9 +461,24 @@
     const actualIncome = (data.transactions || [])
       .filter((t) => isIncome(t) && String(t.date || "").startsWith(mk))
       .reduce((s, t) => s + (Number(t.amount) || 0), 0);
+    const paidSkipped = [];
     const subs = (data.subscriptions || [])
-      .filter((x) => x.active !== false && (!x.endMonth || mk <= String(x.endMonth)))
-      .map((x) => ({ id: x.id, name: x.name, amount: Number(x.amount) || 0, dueDay: x.dueDay }));
+      .filter((x) => subDueInMonth(x, mk))
+      .map((x) => ({
+        id: x.id,
+        name: x.name,
+        amount: Number(x.amount) || 0,
+        dueDay: x.dueDay,
+        frequency: subFrequency(x),
+        paidMarked: isPaidForMonth(x, mk),
+      }))
+      .filter((x) => {
+        if (x.paidMarked) {
+          paidSkipped.push({ kind: "固定", name: x.name, amount: x.amount });
+          return false;
+        }
+        return true;
+      });
     const inst = (data.instalments || [])
       .filter((i) => instDueInMonth(i, mk))
       .map((i) => {
@@ -410,9 +495,17 @@
           dueDay: i.dueDay,
           override: isOverride,
           last,
-          paid: mk === cur && !!instPaidTx(i, mk),
+          paid: !!instPaidTx(i, mk),
+          paidMarked: isPaidForMonth(i, mk),
           pending: !!i.pendingConfirm,
         };
+      })
+      .filter((x) => {
+        if (x.paidMarked) {
+          paidSkipped.push({ kind: "卡數", name: x.name, amount: x.amount });
+          return false;
+        }
+        return true;
       });
     const FIXED_CATS = new Set(["固定", "卡數"]);
     const otherTx = (data.transactions || []).filter((t) => {
@@ -440,6 +533,7 @@
       forecast,
       fixed: subsTotal + instTotal,
       left,
+      paidSkipped,
     };
   }
 
@@ -447,8 +541,11 @@
     return (data.instalments || []).filter(isInstalmentActive);
   }
 
-  function sumInstalments() {
-    return activeInstalments().reduce((s, x) => s + instalmentMonthly(x), 0);
+  function sumInstalments(mk) {
+    const m = mk || monthKey();
+    return (data.instalments || [])
+      .filter((i) => instDueInMonth(i, m) && !isPaidForMonth(i, m))
+      .reduce((s, x) => s + instAmountForMonth(x, m), 0);
   }
 
   function formatMonthLabel(mk) {
@@ -650,9 +747,12 @@
       return d;
     }
 
+    const cur = monthKey();
     (data.subscriptions || []).forEach((s) => {
       const d = nextDueDate(s.dueDay);
       if (!d) return;
+      const dueMk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      if (!subDueInMonth(s, dueMk) || isPaidForMonth(s, dueMk)) return;
       const diff = Math.round((d - today) / 86400000);
       if (diff <= withinDays) {
         items.push({
@@ -669,12 +769,14 @@
     activeInstalments().forEach((i) => {
       const d = nextDueDate(i.dueDay);
       if (!d) return;
+      const dueMk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      if (!instDueInMonth(i, dueMk) || isPaidForMonth(i, dueMk)) return;
       const diff = Math.round((d - today) / 86400000);
       if (diff <= withinDays) {
         items.push({
           kind: "卡數",
           name: i.name,
-          amount: instalmentMonthly(i),
+          amount: instAmountForMonth(i, dueMk),
           dueDay: i.dueDay,
           date: d,
           days: diff,
@@ -865,8 +967,16 @@
                 : row('<span class="sub">未有記帳（預測）</span>', "", "−" + money(0))
             }
           </ul>
+          ${
+            (e.paidSkipped || []).length
+              ? `<div class="bd-head"><span>已還（唔計入）</span><span>${e.paidSkipped.length} 項</span></div>
+          <ul class="list">${e.paidSkipped
+            .map((x) => row(`${esc(x.name)}<span class="tag muted">已還</span>`, esc(x.kind), money(x.amount), "muted-row"))
+            .join("")}</ul>`
+              : ""
+          }
           <div class="bd-head bd-total"><span>剩錢</span><span>${money(e.left)}</span></div>
-          <p class="hero-sub bd-note">計法：實收 − 當月固定 − 當月到期分期 − 已記日常開支。日常開支＝該月記帳入面唔屬「固定／卡數」嘅支出（免同上面重複）。未來月份未記帳＝只計固定同分期。分期按「剩餘期數」逐月計；結單金額只計嗰個月。</p>
+          <p class="hero-sub bd-note">計法：實收 − 當月固定 − 當月到期分期 − 已記日常開支。已標「已還」嘅固定／分期唔計入。日常開支＝唔屬「固定／卡數」嘅支出。每兩個月項目只喺到期月計。分期按「剩餘期數」；結單金額只計嗰個月。</p>
         </details>
       </div>`;
   }
@@ -1417,13 +1527,14 @@
 
   function renderSubs() {
     const el = $("#view-subs");
+    const cur = monthKey();
     const subs = [...(data.subscriptions || [])].sort((a, b) => (a.dueDay || 99) - (b.dueDay || 99));
-    const total = sumSubs();
+    const total = sumSubs(cur);
     el.innerHTML = `
       <div class="card">
-        <h2>每月固定合計</h2>
+        <h2>本月固定合計</h2>
         <div class="hero-amount">${money(total)}</div>
-        <div class="hero-sub">${subs.length} 項訂閱／固定開支</div>
+        <div class="hero-sub">${subs.length} 項 · 已扣「已還」同未到期嘅每兩個月項目</div>
       </div>
       <div class="btn-row" style="margin-bottom:12px">
         <button type="button" class="btn btn-primary" id="btnAddSub">新增固定</button>
@@ -1431,20 +1542,29 @@
       <div class="card" style="padding:4px 12px">
         <ul class="list">
           ${subs
-            .map(
-              (s) => `
-            <li class="list-item">
+            .map((s) => {
+              const freq = subFrequency(s);
+              const dueThis = subDueInMonth(s, cur);
+              const paid = isPaidForMonth(s, cur);
+              const freqLabel = freq === "bimonthly" ? "每兩個月" : "每月";
+              const startHint =
+                freq === "bimonthly" && s.startMonth ? ` · 由 ${esc(s.startMonth)} 起` : "";
+              return `
+            <li class="list-item${paid ? " muted-row" : ""}">
               <div class="meta">
-                <div class="title">${esc(s.name)}</div>
-                <div class="sub">每月 ${s.dueDay || "—"} 號到期</div>
+                <div class="title">${esc(s.name)}${paid ? '<span class="tag muted">已還</span>' : ""}${
+                  freq === "bimonthly" ? '<span class="tag">每兩個月</span>' : ""
+                }${!dueThis ? '<span class="tag muted">本月唔計</span>' : ""}</div>
+                <div class="sub">${freqLabel} ${s.dueDay || "—"} 號${startHint}</div>
               </div>
               <div class="amt">${money(s.amount)}</div>
               <div class="list-actions">
+                <button type="button" class="btn btn-ghost btn-paid ${paid ? "is-paid" : ""}" data-paid-sub="${esc(s.id)}">${paid ? "取消已還" : "已還"}</button>
                 <button type="button" class="icon-btn" data-edit-sub="${esc(s.id)}">✎</button>
                 <button type="button" class="icon-btn danger" data-del-sub="${esc(s.id)}">✕</button>
               </div>
-            </li>`
-            )
+            </li>`;
+            })
             .join("")}
         </ul>
       </div>
@@ -1461,36 +1581,80 @@
     $$("[data-edit-sub]").forEach((b) => {
       b.onclick = () => openSubForm(data.subscriptions.find((s) => s.id === b.dataset.editSub));
     });
+    $$("[data-paid-sub]").forEach((b) => {
+      b.onclick = () => {
+        const item = data.subscriptions.find((s) => s.id === b.dataset.paidSub);
+        if (!item) return;
+        const nowPaid = togglePaidMonth(item, cur);
+        touchUpdated();
+        if (nowPaid) offerRecordPayment("固定", item, cur, item.amount);
+        renderSubs();
+      };
+    });
   }
 
   function openSubForm(existing) {
-    const s = existing || { name: "", amount: "", dueDay: 1 };
+    const s = existing || { name: "", amount: "", dueDay: 1, frequency: "monthly", startMonth: monthKey() };
+    const freq = subFrequency(s);
+    const start = s.startMonth || monthKey();
     openSheet(`
       <div class="sheet-handle"></div>
       <h3>${existing ? "編輯" : "新增"}固定開支</h3>
       <div class="form-row"><label>名稱</label><input class="input" id="sName" value="${esc(s.name)}" /></div>
       <div class="form-row"><label>金額</label><input class="input" type="number" step="0.01" id="sAmt" value="${s.amount}" /></div>
-      <div class="form-row"><label>到期日（每月幾號）</label><input class="input" type="number" min="1" max="28" id="sDue" value="${s.dueDay || 1}" /></div>
+      <div class="form-row"><label>到期日（幾號）</label><input class="input" type="number" min="1" max="28" id="sDue" value="${s.dueDay || 1}" /></div>
+      <div class="form-row"><label>頻率</label>
+        <div class="chips" id="sFreq">
+          <button type="button" class="chip ${freq === "monthly" ? "active" : ""}" data-val="monthly">每月</button>
+          <button type="button" class="chip ${freq === "bimonthly" ? "active" : ""}" data-val="bimonthly">每兩個月</button>
+        </div>
+      </div>
+      <div class="form-row" id="sStartRow" ${freq === "bimonthly" ? "" : "hidden"}>
+        <label>下次／起始月份（YYYY-MM）</label>
+        <input class="input" id="sStart" value="${esc(start)}" placeholder="2026-10" />
+      </div>
       <div class="btn-row">
         <button type="button" class="btn btn-secondary" id="sCancel">取消</button>
         <button type="button" class="btn btn-primary" id="sSave">儲存</button>
       </div>
     `);
+    wireChips("#sFreq");
+    const syncFreq = () => {
+      const f = chipValue("#sFreq") || "monthly";
+      const row = $("#sStartRow");
+      if (row) row.hidden = f !== "bimonthly";
+    };
+    $("#sFreq").addEventListener("click", () => setTimeout(syncFreq, 0));
     $("#sCancel").onclick = closeSheet;
     $("#sSave").onclick = () => {
       const name = $("#sName").value.trim();
       const amount = parseFloat($("#sAmt").value);
       const dueDay = parseInt($("#sDue").value, 10);
+      const frequency = chipValue("#sFreq") || "monthly";
+      let startMonth = ($("#sStart").value || "").trim();
       if (!name || !(amount >= 0)) {
         toast("請填名稱同金額", "error");
         return;
+      }
+      if (frequency === "bimonthly") {
+        if (!/^\d{4}-\d{2}$/.test(startMonth)) {
+          toast("每兩個月請填起始月份（例如 2026-10）", "error");
+          return;
+        }
+      } else {
+        startMonth = undefined;
       }
       if (existing) {
         existing.name = name;
         existing.amount = amount;
         existing.dueDay = dueDay;
+        existing.frequency = frequency;
+        if (frequency === "bimonthly") existing.startMonth = startMonth;
+        else delete existing.startMonth;
       } else {
-        data.subscriptions.push({ id: uid("sub"), name, amount, dueDay });
+        const row = { id: uid("sub"), name, amount, dueDay, frequency };
+        if (frequency === "bimonthly") row.startMonth = startMonth;
+        data.subscriptions.push(row);
       }
       touchUpdated();
       closeSheet();
@@ -1528,19 +1692,27 @@
                     : i.endMonth
                       ? `至 ${i.endMonth}`
                       : "進行中";
+              const cur = monthKey();
+              const paid = isPaidForMonth(i, cur);
+              const amtNow = instAmountForMonth(i, cur);
               return `
-              <li class="list-item${!active ? " muted-row" : ""}">
+              <li class="list-item${!active || paid ? " muted-row" : ""}">
                 <div class="meta">
                   <div class="title">${esc(i.name)}${i.pendingConfirm ? '<span class="tag">待確認</span>' : ""}${
                     i.octStatementOverride ? '<span class="tag muted">十月結單</span>' : ""
-                  }${!active ? '<span class="tag muted">已結束</span>' : ""}</div>
+                  }${paid ? '<span class="tag muted">已還</span>' : ""}${!active ? '<span class="tag muted">已結束</span>' : ""}</div>
                   <div class="sub">${card ? esc(card.name) : ""} · ${i.dueDay || "—"} 號 · ${rem}
                     ${i.fee ? ` · 手續費 ${money(i.fee)}` : ""}
                     ${i.notes ? " · " + esc(i.notes) : ""}
                   </div>
                 </div>
-                <div class="amt">${money(instalmentMonthly(i))}</div>
+                <div class="amt">${money(amtNow)}</div>
                 <div class="list-actions">
+                  ${
+                    active
+                      ? `<button type="button" class="btn btn-ghost btn-paid ${paid ? "is-paid" : ""}" data-paid-inst="${esc(i.id)}">${paid ? "取消已還" : "已還"}</button>`
+                      : ""
+                  }
                   <button type="button" class="icon-btn" data-edit-inst="${esc(i.id)}">✎</button>
                   <button type="button" class="icon-btn danger" data-del-inst="${esc(i.id)}">✕</button>
                 </div>
@@ -1602,6 +1774,17 @@
     });
     $$("[data-edit-inst]").forEach((b) => {
       b.onclick = () => openInstForm(data.instalments.find((i) => i.id === b.dataset.editInst));
+    });
+    $$("[data-paid-inst]").forEach((b) => {
+      b.onclick = () => {
+        const item = data.instalments.find((i) => i.id === b.dataset.paidInst);
+        if (!item) return;
+        const cur = monthKey();
+        const nowPaid = togglePaidMonth(item, cur);
+        touchUpdated();
+        if (nowPaid) offerRecordPayment("卡數", item, cur, instAmountForMonth(item, cur));
+        renderCards();
+      };
     });
     $$("[data-edit-acc]").forEach((b) => {
       b.onclick = () => {
@@ -1997,7 +2180,16 @@
         return;
       }
       subIds.add(String(x.id));
-      plan.subs.push(Object.assign({}, x, { amount: normAmount(x.amount) || 0 }));
+      const row = Object.assign({}, x, { amount: normAmount(x.amount) || 0 });
+      const freq = subFrequency(row);
+      row.frequency = freq;
+      if (freq === "bimonthly") {
+        const sm = String(row.startMonth || row.nextDueMonth || "").trim();
+        if (/^\d{4}-\d{2}$/.test(sm)) row.startMonth = sm;
+      } else {
+        delete row.startMonth;
+      }
+      plan.subs.push(row);
     });
     const instIds = new Set((data.instalments || []).map((x) => String(x.id)));
     instIn.forEach((x) => {
