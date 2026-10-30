@@ -1660,6 +1660,7 @@
       account: chipValue("#accChips") || "其他",
       note: ($("#txNote").value || "").trim(),
       type: isInc ? "income" : "expense",
+      editedAt: nowISO(),
     };
     const meal = !isInc && tx.category === MEAL_CATEGORY ? mealValue("#txMealRow") : "";
     if (meal) tx.sub = meal;
@@ -1780,6 +1781,7 @@
       if (!newInc && (t.account === "enJoy" && isOctopusTopupNote(t.note))) t.octopusTopup = true;
       else if (!newInc && !isOctopusTopupNote(t.note)) delete t.octopusTopup;
       else if (newInc) delete t.octopusTopup;
+      t.editedAt = nowISO();
       applyTxBalanceEffects(t, +1);
       touchUpdated();
       closeSheet();
@@ -2070,6 +2072,7 @@
         $("#aSave").onclick = () => {
           a.balance = parseFloat($("#aBal").value) || 0;
           a.asOf = todayISO();
+          a.editedAt = nowISO();
           touchUpdated();
           closeSheet();
           renderCards();
@@ -2146,7 +2149,7 @@
     el.innerHTML = `
       <div class="card settings-block">
         <h2>Google Drive 同步</h2>
-        <p>${demoMode ? "而家係<strong>演示模式</strong>：資料只存在呢部裝置嘅瀏覽器（localStorage）。填好 config.js 嘅 GOOGLE_CLIENT_ID 之後可登入同步。" : "登入一次之後，開 App／返嚟呢頁會自動靜默續期同同步 phone ↔ 網頁（Drive <span class=\"mono\">fanance-data.json</span>）。唔使次次撳登入。"}</p>
+        <p>${demoMode ? "而家係<strong>演示模式</strong>：資料只存在呢部裝置嘅瀏覽器（localStorage）。填好 config.js 嘅 GOOGLE_CLIENT_ID 之後可登入同步。" : "登入一次之後會自動同步。兩邊改動會<strong>合併</strong>（唔會再用成個檔案覆蓋），記錄按 id 同內容去重。Drive：<span class=\"mono\">fanance-data.json</span>。"}</p>
         <p>狀態：${
           syncState === "syncing"
             ? "同步中…"
@@ -2160,7 +2163,7 @@
         }</p>
         <p>上次同步：<span class="mono">${esc(last)}</span></p>
         <p>本地更新：<span class="mono">${esc(data.updatedAt || "—")}</span></p>
-        <p class="hero-sub">開住畫面時約每 45 秒會輕量檢查另一部裝置有冇改動。完全閂咗 App 就唔會喺背後同步（PWA 限制）。</p>
+        <p class="hero-sub">開住畫面時約每 45 秒會拉 Drive 合併兩邊改動（唔會成個檔覆蓋）。完全閂咗 App 就唔會喺背後同步（PWA 限制）。刪咗嘅記錄如果另一邊仲喺度，合併時可能會返嚟。</p>
         <div class="btn-row" style="flex-direction:column">
           <button type="button" class="btn btn-primary" id="btnLogin" ${demoMode && !hasClientId ? "disabled" : ""}>${meta.signedIn && syncState === "need_login" ? "重新連線 Google" : meta.signedIn ? "重新授權（通常唔使）" : "登入 Google（只需一次）"}</button>
           <button type="button" class="btn btn-secondary" id="btnSyncNow" ${!meta.signedIn ? "disabled" : ""}>立即同步</button>
@@ -2577,6 +2580,315 @@
     toast("已匯出", "ok");
   }
 
+  // ——— Drive merge sync (safer than whole-file LWW) ———
+  function parseTimeMs(v) {
+    if (v == null || v === "") return 0;
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    const s = String(v);
+    // date-only asOf → end of that local day bias avoided; treat as UTC noon-ish via Date
+    const t = Date.parse(s.length === 10 ? s + "T12:00:00" : s);
+    return Number.isFinite(t) ? t : 0;
+  }
+
+  function entityTimeMs(obj, fallbackMs) {
+    if (!obj || typeof obj !== "object") return fallbackMs || 0;
+    return (
+      parseTimeMs(obj.editedAt) ||
+      parseTimeMs(obj.updatedAt) ||
+      parseTimeMs(obj.asOf) ||
+      fallbackMs ||
+      0
+    );
+  }
+
+  function cloneJson(x) {
+    return JSON.parse(JSON.stringify(x));
+  }
+
+  function txContentEqual(a, b) {
+    if (!a || !b) return false;
+    return (
+      String(a.date || "") === String(b.date || "") &&
+      Number(a.amount) === Number(b.amount) &&
+      String(a.category || "") === String(b.category || "") &&
+      String(a.note || "").trim() === String(b.note || "").trim() &&
+      String(a.account || "") === String(b.account || "") &&
+      String(a.type || "") === String(b.type || "") &&
+      String(a.sub || "") === String(b.sub || "") &&
+      !!a.octopusTopup === !!b.octopusTopup
+    );
+  }
+
+  function preferEntity(a, b, localDocMs, remoteDocMs) {
+    const ta = entityTimeMs(a, localDocMs);
+    const tb = entityTimeMs(b, remoteDocMs);
+    if (ta !== tb) return ta >= tb ? a : b;
+    // tie: prefer remote if remote doc newer, else local
+    if (remoteDocMs !== localDocMs) return remoteDocMs >= localDocMs ? b : a;
+    return a;
+  }
+
+  function mergeById(localArr, remoteArr, opts) {
+    const localDocMs = opts.localDocMs || 0;
+    const remoteDocMs = opts.remoteDocMs || 0;
+    const mergeSame = opts.mergeSame || ((a, b) => preferEntity(a, b, localDocMs, remoteDocMs));
+    const keyFn = opts.keyFn || ((x) => (x && x.id != null ? String(x.id) : ""));
+    const map = new Map();
+    const order = [];
+    function add(item, side) {
+      if (!item || typeof item !== "object") return;
+      const k = keyFn(item);
+      if (!k) {
+        // no id — keep as unique by pushing with synthetic key
+        const syn = "anon:" + order.length + ":" + side;
+        map.set(syn, cloneJson(item));
+        order.push(syn);
+        return;
+      }
+      if (!map.has(k)) {
+        map.set(k, cloneJson(item));
+        order.push(k);
+      } else {
+        map.set(k, cloneJson(mergeSame(map.get(k), item, side)));
+      }
+    }
+    (localArr || []).forEach((x) => add(x, "local"));
+    (remoteArr || []).forEach((x) => add(x, "remote"));
+    return order.map((k) => map.get(k));
+  }
+
+  function mergePaidMonths(a, b) {
+    const set = new Set([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])].map(String));
+    return [...set].sort();
+  }
+
+  function mergeAccountPair(a, b, localDocMs, remoteDocMs) {
+    const preferred = preferEntity(a, b, localDocMs, remoteDocMs);
+    const other = preferred === a ? b : a;
+    const base = cloneJson(preferred);
+    // Prefer newer asOf / editedAt for balance; never clobber a real balance with empty/missing
+    const aTime = Math.max(entityTimeMs(a), parseTimeMs(a && a.asOf));
+    const bTime = Math.max(entityTimeMs(b), parseTimeMs(b && b.asOf));
+    let balSrc;
+    if (aTime !== bTime) balSrc = aTime > bTime ? a : b;
+    else {
+      const aBal = Number(a.balance);
+      const bBal = Number(b.balance);
+      const aHas = a.balance != null && !Number.isNaN(aBal);
+      const bHas = b.balance != null && !Number.isNaN(bBal);
+      if (aHas && !bHas) balSrc = a;
+      else if (bHas && !aHas) balSrc = b;
+      else if (aHas && bHas && aBal !== bBal) {
+        balSrc = remoteDocMs >= localDocMs ? b : a;
+      } else balSrc = aHas ? a : b;
+    }
+    base.balance = Number(balSrc.balance) || 0;
+    if (balSrc.asOf) base.asOf = balSrc.asOf;
+    if (balSrc.editedAt) base.editedAt = balSrc.editedAt;
+    if (!base.kind && other.kind) base.kind = other.kind;
+    if (!base.notes && other.notes) base.notes = other.notes;
+    if (!base.name && other.name) base.name = other.name;
+    return base;
+  }
+
+  function mergeSubOrInst(a, b, localDocMs, remoteDocMs) {
+    const newer = preferEntity(a, b, localDocMs, remoteDocMs);
+    const older = newer === a ? b : a;
+    const out = cloneJson(newer);
+    out.paidMonths = mergePaidMonths(a.paidMonths, b.paidMonths);
+    if (out.notes == null && older.notes) out.notes = older.notes;
+    if (out.frequency == null && older.frequency) out.frequency = older.frequency;
+    if (out.startMonth == null && older.startMonth) out.startMonth = older.startMonth;
+    if (out.cardId == null && older.cardId) out.cardId = older.cardId;
+    // remaining: prefer entity with newer time
+    return out;
+  }
+
+  function mergeTransactions(localTx, remoteTx, localDocMs, remoteDocMs) {
+    const byId = new Map();
+    const stats = { kept: 0, conflicts: 0, fromLocal: 0, fromRemote: 0 };
+
+    function consider(t, side) {
+      if (!t || typeof t !== "object") return;
+      const id = t.id != null && String(t.id).trim() ? String(t.id).trim() : null;
+      if (!id) return;
+      if (!byId.has(id)) {
+        byId.set(id, cloneJson(t));
+        if (side === "local") stats.fromLocal++;
+        else stats.fromRemote++;
+        return;
+      }
+      const cur = byId.get(id);
+      if (txContentEqual(cur, t)) return;
+      stats.conflicts++;
+      byId.set(id, cloneJson(preferEntity(cur, t, localDocMs, remoteDocMs)));
+    }
+
+    (localTx || []).forEach((t) => consider(t, "local"));
+    (remoteTx || []).forEach((t) => consider(t, "remote"));
+
+    // Dedupe by content key across different ids (keep newer entity / prefer existing)
+    const byKey = new Map();
+    const out = [];
+    [...byId.values()]
+      .sort((a, b) => entityTimeMs(b, 0) - entityTimeMs(a, 0))
+      .forEach((t) => {
+        const k = txDedupeKey(t);
+        if (byKey.has(k)) {
+          const prev = byKey.get(k);
+          // same content different ids — keep one (prefer one with id already chosen / newer)
+          const winner = preferEntity(prev, t, localDocMs, remoteDocMs);
+          byKey.set(k, winner);
+          return;
+        }
+        byKey.set(k, t);
+      });
+    byKey.forEach((t) => out.push(t));
+    stats.kept = out.length;
+    // stable-ish sort by date desc
+    out.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+    return { list: out, stats };
+  }
+
+  function mergeProfiles(localP, remoteP, localDocMs, remoteDocMs) {
+    const a = localP && typeof localP === "object" ? localP : {};
+    const b = remoteP && typeof remoteP === "object" ? remoteP : {};
+    const newer = remoteDocMs >= localDocMs ? b : a;
+    const older = newer === b ? a : b;
+    const out = Object.assign({}, older, newer);
+    const budgets = Object.assign({}, older.categoryBudgets || {}, newer.categoryBudgets || {});
+    // fill missing budget keys from older
+    Object.keys(older.categoryBudgets || {}).forEach((k) => {
+      if (budgets[k] == null) budgets[k] = older.categoryBudgets[k];
+    });
+    out.categoryBudgets = budgets;
+    return out;
+  }
+
+  function mergeMonthHistory(localH, remoteH) {
+    const map = new Map();
+    [...(localH || []), ...(remoteH || [])].forEach((h) => {
+      if (!h || !h.month) return;
+      const k = String(h.month);
+      if (!map.has(k)) map.set(k, cloneJson(h));
+      else {
+        const cur = map.get(k);
+        const tCur = parseTimeMs(cur.archivedAt);
+        const tNew = parseTimeMs(h.archivedAt);
+        map.set(k, tNew >= tCur ? cloneJson(h) : cur);
+      }
+    });
+    return [...map.values()].sort((a, b) => (a.month < b.month ? -1 : 1));
+  }
+
+  /**
+   * Merge two Fanance documents. Never drops unique txs/accounts/subs/insts from either side.
+   * Returns { data, changed, summary }.
+   */
+  function mergeFananceData(localDoc, remoteDoc) {
+    const local = localDoc && typeof localDoc === "object" ? localDoc : {};
+    const remote = remoteDoc && typeof remoteDoc === "object" ? remoteDoc : {};
+    const localDocMs = parseTimeMs(local.updatedAt);
+    const remoteDocMs = parseTimeMs(remote.updatedAt);
+
+    const txMerge = mergeTransactions(local.transactions, remote.transactions, localDocMs, remoteDocMs);
+
+    const accounts = mergeById(local.accounts, remote.accounts, {
+      localDocMs,
+      remoteDocMs,
+      keyFn: (x) => {
+        if (x && x.id != null && String(x.id)) return "id:" + x.id;
+        if (x && x.name) return "name:" + x.name;
+        return "";
+      },
+      mergeSame: (a, b) => mergeAccountPair(a, b, localDocMs, remoteDocMs),
+    });
+
+    const subscriptions = mergeById(local.subscriptions, remote.subscriptions, {
+      localDocMs,
+      remoteDocMs,
+      mergeSame: (a, b) => mergeSubOrInst(a, b, localDocMs, remoteDocMs),
+    });
+
+    const instalments = mergeById(local.instalments, remote.instalments, {
+      localDocMs,
+      remoteDocMs,
+      mergeSame: (a, b) => mergeSubOrInst(a, b, localDocMs, remoteDocMs),
+    });
+
+    const cards = mergeById(local.cards, remote.cards, {
+      localDocMs,
+      remoteDocMs,
+      mergeSame: (a, b) => preferEntity(a, b, localDocMs, remoteDocMs),
+    });
+
+    const profile = mergeProfiles(local.profile, remote.profile, localDocMs, remoteDocMs);
+    const monthHistory = mergeMonthHistory(local.monthHistory, remote.monthHistory);
+
+    let lastMonthKey = local.lastMonthKey || remote.lastMonthKey || null;
+    if (local.lastMonthKey && remote.lastMonthKey) {
+      lastMonthKey = local.lastMonthKey >= remote.lastMonthKey ? local.lastMonthKey : remote.lastMonthKey;
+    }
+
+    const version = Math.max(Number(local.version) || 1, Number(remote.version) || 1);
+
+    const merged = {
+      version,
+      updatedAt: nowISO(),
+      profile,
+      accounts,
+      cards,
+      instalments,
+      subscriptions,
+      transactions: txMerge.list,
+      monthHistory,
+    };
+    if (lastMonthKey) merged.lastMonthKey = lastMonthKey;
+
+    // Preserve any other top-level keys from newer doc, then fill from older
+    const newerDoc = remoteDocMs >= localDocMs ? remote : local;
+    const olderDoc = newerDoc === remote ? local : remote;
+    Object.keys(olderDoc).forEach((k) => {
+      if (merged[k] === undefined) merged[k] = cloneJson(olderDoc[k]);
+    });
+    Object.keys(newerDoc).forEach((k) => {
+      if (
+        [
+          "version",
+          "updatedAt",
+          "profile",
+          "accounts",
+          "cards",
+          "instalments",
+          "subscriptions",
+          "transactions",
+          "monthHistory",
+          "lastMonthKey",
+        ].includes(k)
+      )
+        return;
+      if (merged[k] === undefined) merged[k] = cloneJson(newerDoc[k]);
+    });
+
+    const localTxN = (local.transactions || []).length;
+    const remoteTxN = (remote.transactions || []).length;
+    const changed =
+      merged.transactions.length !== localTxN ||
+      merged.transactions.length !== remoteTxN ||
+      JSON.stringify(merged.transactions) !== JSON.stringify(local.transactions || []) ||
+      JSON.stringify(merged.accounts) !== JSON.stringify(local.accounts || []) ||
+      localDocMs !== remoteDocMs;
+
+    const summary = {
+      tx: merged.transactions.length,
+      txLocal: localTxN,
+      txRemote: remoteTxN,
+      txConflicts: txMerge.stats.conflicts,
+      accounts: merged.accounts.length,
+    };
+    return { data: merged, changed, summary };
+  }
+
   // ——— Google Drive Sync ———
   function waitForGis() {
     if (!hasClientId) return Promise.reject(new Error("未設定 GOOGLE_CLIENT_ID"));
@@ -2876,26 +3188,27 @@
   }
 
   function schedulePush() {
+    /* Never push-only — always pull→merge→push so the other device isn't overwritten. */
     if (!meta.signedIn) return;
     clearTimeout(pushTimer);
     pushTimer = setTimeout(() => {
-      (async () => {
-        try {
-          await ensureAccessToken({ interactive: false });
-          setSyncState("syncing");
-          await pushRemote();
-          setSyncState("ok");
-          lastAutoSyncAt = Date.now();
-          updateChrome();
-        } catch (e) {
-          console.warn("schedulePush", e);
-          if (syncState !== "need_login") setSyncState("error", e.message || "推送失敗");
-          // Quiet on auto-push failure; badge shows state. Manual sync still available.
-        }
-      })();
+      syncNow(false).catch((e) => console.warn("schedulePush", e));
     }, 1500);
   }
 
+  function refreshActiveViewQuiet() {
+    updateChrome();
+    if (currentView === "overview") renderOverview();
+    else if (currentView === "ledger") renderLedger();
+    else if (currentView === "subs") renderSubs();
+    else if (currentView === "cards") renderCards();
+    else if (currentView === "settings") renderSettings();
+  }
+
+  /**
+   * Safe sync: pull remote → merge with local → save → push merged.
+   * Replaces whole-file last-write-wins.
+   */
   async function syncNow(showToast, opts) {
     const quiet = !showToast;
     if (!meta.signedIn) {
@@ -2908,38 +3221,41 @@
         setSyncState("syncing");
         await ensureAccessToken({ interactive: !!showToast });
         const remote = await pullRemote();
-        if (remote && remote.updatedAt) {
-          const localT = Date.parse(data.updatedAt || 0) || 0;
-          const remoteT = Date.parse(remote.updatedAt) || 0;
-          if (remoteT > localT) {
-            data = remote;
-            migrateData();
-            runMonthRolloverIfNeeded();
-            if (showToast) toast("已由 Drive 拉最新資料", "ok");
-          } else if (localT > remoteT) {
-            await pushRemote();
-            if (showToast) toast("已推上 Drive", "ok");
-          } else {
-            if (showToast) toast("已係最新", "ok");
-            meta.lastSyncAt = nowISO();
-            saveLocal();
+        let summary = null;
+        if (remote && typeof remote === "object") {
+          const beforeTx = (data.transactions || []).length;
+          const result = mergeFananceData(data, remote);
+          data = result.data;
+          // Soft migrate without nested schedulePush storms
+          ensureCategoryBudgets();
+          ensureRequiredAccounts();
+          runMonthRolloverIfNeeded();
+          data.updatedAt = nowISO();
+          saveLocal();
+          await pushRemote();
+          summary = result.summary;
+          if (showToast) {
+            const gained = Math.max(0, (data.transactions || []).length - beforeTx);
+            const remoteOnly = Math.max(0, (summary.tx || 0) - beforeTx);
+            toast(
+              gained > 0 || (summary.txRemote || 0) !== beforeTx
+                ? `已合併同步（記錄 ${summary.tx} 筆）`
+                : "已合併同步（兩邊資料齊）",
+              "ok"
+            );
           }
         } else {
+          ensureCategoryBudgets();
+          ensureRequiredAccounts();
+          data.updatedAt = data.updatedAt || nowISO();
+          saveLocal();
           await pushRemote();
           if (showToast) toast("已推上 Drive", "ok");
         }
         setSyncState("ok");
         lastAutoSyncAt = Date.now();
         if (!quiet) render();
-        else {
-          updateChrome();
-          // Refresh current view quietly so other-device edits appear
-          if (currentView === "overview") renderOverview();
-          else if (currentView === "ledger") renderLedger();
-          else if (currentView === "subs") renderSubs();
-          else if (currentView === "cards") renderCards();
-          else if (currentView === "settings") renderSettings();
-        }
+        else refreshActiveViewQuiet();
       } catch (e) {
         console.error(e);
         const msg = e.message || String(e);
