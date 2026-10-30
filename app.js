@@ -47,9 +47,22 @@
   let pushTimer = null;
   let tokenClient = null;
   let accessToken = null;
+  let tokenExpiresAt = 0; // ms epoch; access tokens ~1h
   let gsiReady = false;
+  let gsiInitPromise = null;
+  let tokenRequestInFlight = null;
+  let syncState = "idle"; // idle | syncing | ok | error | need_login
+  let syncErrorMsg = "";
+  let syncInFlight = null;
+  let pollTimer = null;
+  let resumeTimer = null;
+  let lastAutoSyncAt = 0;
   let leftMonthOffset = 0; // overview 進階預測 month selector (0 = this month); UI-only, not saved
   let ledgerMonthFilter = monthKeyNow(); // "YYYY-MM" or "" for 全部; UI-only
+  const POLL_MS = 45000;
+  const RESUME_DEBOUNCE_MS = 1200;
+  const TOKEN_SKEW_MS = 90 * 1000;
+  const AUTO_SYNC_MIN_GAP_MS = 8000;
 
   function monthKeyNow() {
     const d = new Date();
@@ -938,14 +951,35 @@
   function updateChrome() {
     const badge = $("#modeBadge");
     const dot = $("#syncDot");
-    if (demoMode || !meta.signedIn) {
-      badge.textContent = demoMode ? "演示模式" : "本地";
+    if (demoMode) {
+      badge.textContent = "演示模式";
+    } else if (!meta.signedIn) {
+      badge.textContent = "本地";
+    } else if (syncState === "syncing") {
+      badge.textContent = "同步中…";
+    } else if (syncState === "need_login") {
+      badge.textContent = "要重新連線";
+    } else if (syncState === "error") {
+      badge.textContent = "同步失敗";
+    } else if (meta.signedIn && accessToken) {
+      badge.textContent = "自動同步";
+    } else if (meta.signedIn) {
+      badge.textContent = "連線中…";
     } else {
-      badge.textContent = "已同步";
+      badge.textContent = "本地";
     }
+    badge.title = syncErrorMsg || (meta.lastSyncAt ? "上次同步 " + meta.lastSyncAt : "");
     dot.className = "sync-dot";
-    if (meta.signedIn && accessToken) dot.classList.add("on");
+    if (syncState === "syncing") dot.classList.add("warn");
+    else if (syncState === "error" || syncState === "need_login") dot.classList.add("err");
+    else if (meta.signedIn && accessToken) dot.classList.add("on");
     else if (!navigator.onLine) dot.classList.add("warn");
+  }
+
+  function setSyncState(state, errMsg) {
+    syncState = state;
+    syncErrorMsg = errMsg || "";
+    updateChrome();
   }
 
   /** Expense totals by category for month mk (income skipped). */
@@ -2112,12 +2146,23 @@
     el.innerHTML = `
       <div class="card settings-block">
         <h2>Google Drive 同步</h2>
-        <p>${demoMode ? "而家係<strong>演示模式</strong>：資料只存在呢部裝置嘅瀏覽器（localStorage）。填好 config.js 嘅 GOOGLE_CLIENT_ID 之後可登入同步。" : "用 Google 帳戶同步 fanance-data.json 去 Drive。"}</p>
-        <p>狀態：${meta.signedIn ? `已登入${meta.email ? "（" + esc(meta.email) + "）" : ""}` : "未登入"}</p>
+        <p>${demoMode ? "而家係<strong>演示模式</strong>：資料只存在呢部裝置嘅瀏覽器（localStorage）。填好 config.js 嘅 GOOGLE_CLIENT_ID 之後可登入同步。" : "登入一次之後，開 App／返嚟呢頁會自動靜默續期同同步 phone ↔ 網頁（Drive <span class=\"mono\">fanance-data.json</span>）。唔使次次撳登入。"}</p>
+        <p>狀態：${
+          syncState === "syncing"
+            ? "同步中…"
+            : syncState === "need_login"
+              ? "登入已過期 — 撳下面重新連線一次"
+              : syncState === "error"
+                ? "同步失敗" + (syncErrorMsg ? "（" + esc(syncErrorMsg) + "）" : "")
+                : meta.signedIn
+                  ? `已記住登入${meta.email ? "（" + esc(meta.email) + "）" : ""}${accessToken ? " · 連線中" : " · 準備自動連線"}`
+                  : "未登入"
+        }</p>
         <p>上次同步：<span class="mono">${esc(last)}</span></p>
         <p>本地更新：<span class="mono">${esc(data.updatedAt || "—")}</span></p>
+        <p class="hero-sub">開住畫面時約每 45 秒會輕量檢查另一部裝置有冇改動。完全閂咗 App 就唔會喺背後同步（PWA 限制）。</p>
         <div class="btn-row" style="flex-direction:column">
-          <button type="button" class="btn btn-primary" id="btnLogin" ${demoMode && !hasClientId ? "disabled" : ""}>登入 Google</button>
+          <button type="button" class="btn btn-primary" id="btnLogin" ${demoMode && !hasClientId ? "disabled" : ""}>${meta.signedIn && syncState === "need_login" ? "重新連線 Google" : meta.signedIn ? "重新授權（通常唔使）" : "登入 Google（只需一次）"}</button>
           <button type="button" class="btn btn-secondary" id="btnSyncNow" ${!meta.signedIn ? "disabled" : ""}>立即同步</button>
           <button type="button" class="btn btn-ghost" id="btnLogout" ${!meta.signedIn ? "disabled" : ""}>登出</button>
         </div>
@@ -2196,7 +2241,7 @@
       </div>
     `;
 
-    $("#btnLogin").onclick = () => googleLogin();
+    $("#btnLogin").onclick = () => googleLogin({ forceConsent: syncState === "need_login" });
     $("#btnSyncNow").onclick = () => syncNow(true);
     $("#btnLogout").onclick = () => googleLogout();
     $("#btnSaveProfile").onclick = () => {
@@ -2533,71 +2578,189 @@
   }
 
   // ——— Google Drive Sync ———
+  function waitForGis() {
+    if (!hasClientId) return Promise.reject(new Error("未設定 GOOGLE_CLIENT_ID"));
+    if (gsiReady && tokenClient) return Promise.resolve();
+    if (gsiInitPromise) return gsiInitPromise;
+    gsiInitPromise = new Promise((resolve, reject) => {
+      let tries = 0;
+      const tryInit = () => {
+        if (!window.google || !google.accounts || !google.accounts.oauth2) {
+          if (++tries > 100) {
+            reject(new Error("Google 登入元件載入失敗"));
+            return;
+          }
+          setTimeout(tryInit, 100);
+          return;
+        }
+        tokenClient = google.accounts.oauth2.initTokenClient({
+          client_id: CFG.GOOGLE_CLIENT_ID,
+          scope: "https://www.googleapis.com/auth/drive.file",
+          callback: () => {}, // replaced per request
+        });
+        gsiReady = true;
+        resolve();
+      };
+      tryInit();
+    });
+    return gsiInitPromise;
+  }
+
   function initGis() {
     if (!hasClientId) return;
-    const tryInit = () => {
-      if (!window.google || !google.accounts || !google.accounts.oauth2) {
-        setTimeout(tryInit, 200);
-        return;
-      }
-      tokenClient = google.accounts.oauth2.initTokenClient({
-        client_id: CFG.GOOGLE_CLIENT_ID,
-        scope: "https://www.googleapis.com/auth/drive.file",
-        callback: (resp) => {
-          if (resp.error) {
-            toast("登入失敗：" + resp.error, "error");
+    waitForGis().catch((e) => console.warn("initGis", e));
+  }
+
+  /**
+   * Request an access token via GIS Token Client.
+   * prompt "" = silent renew when possible; "consent" only when needed.
+   */
+  function requestAccessToken(prompt) {
+    return waitForGis().then(() => {
+      if (tokenRequestInFlight) return tokenRequestInFlight;
+      tokenRequestInFlight = new Promise((resolve, reject) => {
+        tokenClient.callback = (resp) => {
+          tokenRequestInFlight = null;
+          if (!resp || resp.error) {
+            reject(Object.assign(new Error((resp && resp.error) || "token_error"), { resp }));
             return;
           }
           accessToken = resp.access_token;
+          const expSec = Number(resp.expires_in) || 3600;
+          tokenExpiresAt = Date.now() + expSec * 1000;
           meta.signedIn = true;
           saveLocal();
-          toast("已登入 Google", "ok");
-          syncNow(true);
-          render();
-        },
+          resolve(resp);
+        };
+        tokenClient.error_callback = (err) => {
+          tokenRequestInFlight = null;
+          const msg = (err && (err.message || err.type || err.error)) || "popup_failed";
+          reject(new Error(String(msg)));
+        };
+        try {
+          tokenClient.requestAccessToken({ prompt: prompt || "" });
+        } catch (e) {
+          tokenRequestInFlight = null;
+          reject(e);
+        }
       });
-      gsiReady = true;
-    };
-    tryInit();
+      return tokenRequestInFlight;
+    });
   }
 
-  function googleLogin() {
+  function tokenStillValid() {
+    return !!(accessToken && Date.now() < tokenExpiresAt - TOKEN_SKEW_MS);
+  }
+
+  /**
+   * Ensure we have a usable access token.
+   * Tries silent renew first; only interactive/consent when asked or silent fails + interactive.
+   */
+  async function ensureAccessToken(opts) {
+    const interactive = !!(opts && opts.interactive);
+    const forceConsent = !!(opts && opts.forceConsent);
+    if (tokenStillValid()) return accessToken;
+    if (!meta.signedIn && !interactive) {
+      setSyncState("need_login", "未登入");
+      throw new Error("未登入");
+    }
+    await waitForGis();
+    if (!forceConsent) {
+      try {
+        await requestAccessToken("");
+        if (accessToken) {
+          setSyncState("ok");
+          return accessToken;
+        }
+      } catch (e) {
+        if (!interactive) {
+          setSyncState("need_login", e.message || "靜默續期失敗");
+          throw e;
+        }
+        // interactive: fall through to consent once
+      }
+    }
+    await requestAccessToken("consent");
+    setSyncState("ok");
+    return accessToken;
+  }
+
+  async function refreshUserEmail() {
+    if (!accessToken) return;
+    try {
+      const res = await fetch("https://www.googleapis.com/drive/v3/about?fields=user", {
+        headers: { Authorization: "Bearer " + accessToken },
+      });
+      if (!res.ok) return;
+      const j = await res.json();
+      const email = j && j.user && j.user.emailAddress;
+      if (email && email !== meta.email) {
+        meta.email = email;
+        saveLocal();
+      }
+    } catch (_) {
+      /* optional */
+    }
+  }
+
+  async function googleLogin(opts) {
     if (!hasClientId) {
       toast("請先喺 config.js 填 GOOGLE_CLIENT_ID", "error");
       return;
     }
-    if (!gsiReady || !tokenClient) {
-      toast("Google 登入元件未就緒，請稍後再試", "error");
-      initGis();
-      return;
+    try {
+      setSyncState("syncing");
+      const forceConsent = !!(opts && opts.forceConsent) || !meta.signedIn;
+      await ensureAccessToken({ interactive: true, forceConsent });
+      await refreshUserEmail();
+      toast(forceConsent ? "已登入 Google — 之後會自動同步" : "已重新連線", "ok");
+      await syncNow(true);
+      startAutoSyncLoop();
+      render();
+    } catch (e) {
+      console.error(e);
+      setSyncState("need_login", e.message || "登入失敗");
+      toast("登入失敗：" + (e.message || e), "error");
+      render();
     }
-    tokenClient.requestAccessToken({ prompt: meta.signedIn ? "" : "consent" });
   }
 
   function googleLogout() {
+    const tok = accessToken;
     accessToken = null;
+    tokenExpiresAt = 0;
     meta.signedIn = false;
     meta.email = null;
     saveLocal();
-    if (window.google && google.accounts && google.accounts.oauth2 && accessToken) {
-      /* token already cleared */
-    }
+    stopAutoSyncLoop();
+    setSyncState("idle");
+    try {
+      if (tok && window.google && google.accounts && google.accounts.oauth2) {
+        google.accounts.oauth2.revoke(tok, () => {});
+      }
+    } catch (_) {}
     toast("已登出", "ok");
     render();
   }
 
-  async function driveFetch(path, opts = {}) {
+  async function driveFetch(path, opts = {}, allowRetry) {
+    const canRetry = allowRetry !== false;
     if (!accessToken) throw new Error("未登入");
     const headers = Object.assign(
       { Authorization: "Bearer " + accessToken },
       opts.headers || {}
     );
     const res = await fetch("https://www.googleapis.com/drive/v3" + path, { ...opts, headers });
-    if (res.status === 401) {
-      meta.signedIn = false;
+    if (res.status === 401 && canRetry) {
       accessToken = null;
-      saveLocal();
-      throw new Error("登入已過期，請重新登入");
+      tokenExpiresAt = 0;
+      try {
+        await ensureAccessToken({ interactive: false });
+        return driveFetch(path, opts, false);
+      } catch (e) {
+        setSyncState("need_login", "登入已過期");
+        throw new Error("登入已過期，請喺設定重新連線一次");
+      }
     }
     return res;
   }
@@ -2612,7 +2775,6 @@
       meta.driveFileId = null;
     }
 
-    // Find by name + appProperties
     const q = encodeURIComponent(
       `name='${CFG.DRIVE_FILE_NAME}' and trashed=false and appProperties has { key='fanance' and value='true' }`
     );
@@ -2624,7 +2786,6 @@
       return meta.driveFileId;
     }
 
-    // Fallback: name only (created by this app via drive.file)
     const q2 = encodeURIComponent(`name='${CFG.DRIVE_FILE_NAME}' and trashed=false`);
     res = await driveFetch(`/files?q=${q2}&spaces=drive&fields=files(id,name)`);
     json = await res.json();
@@ -2634,7 +2795,6 @@
       return meta.driveFileId;
     }
 
-    // Create folder Fanance if needed
     let folderId = null;
     const fq = encodeURIComponent(
       `name='${CFG.DRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`
@@ -2655,7 +2815,6 @@
       folderId = json.id;
     }
 
-    // Create file
     const metadata = {
       name: CFG.DRIVE_FILE_NAME,
       mimeType: "application/json",
@@ -2694,7 +2853,8 @@
     return JSON.parse(text);
   }
 
-  async function pushRemote() {
+  async function pushRemote(allowRetry) {
+    const canRetry = allowRetry !== false;
     const id = await findOrCreateDriveFile();
     const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media`, {
       method: "PATCH",
@@ -2704,61 +2864,163 @@
       },
       body: JSON.stringify(data),
     });
+    if (res.status === 401 && canRetry) {
+      accessToken = null;
+      tokenExpiresAt = 0;
+      await ensureAccessToken({ interactive: false });
+      return pushRemote(false);
+    }
     if (!res.ok) throw new Error("上傳失敗：" + (await res.text()));
     meta.lastSyncAt = nowISO();
     saveLocal();
   }
 
   function schedulePush() {
-    if (!meta.signedIn || !accessToken) return;
+    if (!meta.signedIn) return;
     clearTimeout(pushTimer);
     pushTimer = setTimeout(() => {
-      pushRemote()
-        .then(() => {
+      (async () => {
+        try {
+          await ensureAccessToken({ interactive: false });
+          setSyncState("syncing");
+          await pushRemote();
+          setSyncState("ok");
+          lastAutoSyncAt = Date.now();
           updateChrome();
-        })
-        .catch((e) => toast("同步失敗：" + e.message, "error"));
+        } catch (e) {
+          console.warn("schedulePush", e);
+          if (syncState !== "need_login") setSyncState("error", e.message || "推送失敗");
+          // Quiet on auto-push failure; badge shows state. Manual sync still available.
+        }
+      })();
     }, 1500);
   }
 
-  async function syncNow(showToast) {
-    if (!meta.signedIn || !accessToken) {
-      if (showToast) toast("請先登入 Google", "error");
+  async function syncNow(showToast, opts) {
+    const quiet = !showToast;
+    if (!meta.signedIn) {
+      if (showToast) toast("請先登入 Google（通常只需一次）", "error");
       return;
     }
-    try {
-      const remote = await pullRemote();
-      if (remote && remote.updatedAt) {
-        const localT = Date.parse(data.updatedAt || 0) || 0;
-        const remoteT = Date.parse(remote.updatedAt) || 0;
-        if (remoteT > localT) {
-          data = remote;
-          migrateData();
-          runMonthRolloverIfNeeded();
-          if (showToast) toast("已由 Drive 拉最新資料", "ok");
-        } else if (localT > remoteT) {
+    if (syncInFlight) return syncInFlight;
+    syncInFlight = (async () => {
+      try {
+        setSyncState("syncing");
+        await ensureAccessToken({ interactive: !!showToast });
+        const remote = await pullRemote();
+        if (remote && remote.updatedAt) {
+          const localT = Date.parse(data.updatedAt || 0) || 0;
+          const remoteT = Date.parse(remote.updatedAt) || 0;
+          if (remoteT > localT) {
+            data = remote;
+            migrateData();
+            runMonthRolloverIfNeeded();
+            if (showToast) toast("已由 Drive 拉最新資料", "ok");
+          } else if (localT > remoteT) {
+            await pushRemote();
+            if (showToast) toast("已推上 Drive", "ok");
+          } else {
+            if (showToast) toast("已係最新", "ok");
+            meta.lastSyncAt = nowISO();
+            saveLocal();
+          }
+        } else {
           await pushRemote();
           if (showToast) toast("已推上 Drive", "ok");
-        } else {
-          if (showToast) toast("已係最新", "ok");
-          meta.lastSyncAt = nowISO();
-          saveLocal();
         }
-      } else {
-        await pushRemote();
-        if (showToast) toast("已推上 Drive", "ok");
+        setSyncState("ok");
+        lastAutoSyncAt = Date.now();
+        if (!quiet) render();
+        else {
+          updateChrome();
+          // Refresh current view quietly so other-device edits appear
+          if (currentView === "overview") renderOverview();
+          else if (currentView === "ledger") renderLedger();
+          else if (currentView === "subs") renderSubs();
+          else if (currentView === "cards") renderCards();
+          else if (currentView === "settings") renderSettings();
+        }
+      } catch (e) {
+        console.error(e);
+        const msg = e.message || String(e);
+        if (/過期|未登入|靜默|token|popup|access_denied|immediate/i.test(msg)) {
+          setSyncState("need_login", msg);
+        } else {
+          setSyncState("error", msg);
+        }
+        if (showToast || syncState === "need_login") {
+          toast("同步錯誤：" + msg, "error");
+        }
+      } finally {
+        syncInFlight = null;
       }
-      render();
+    })();
+    return syncInFlight;
+  }
+
+  function queueResumeSync(reason) {
+    if (!meta.signedIn || demoMode) return;
+    clearTimeout(resumeTimer);
+    resumeTimer = setTimeout(() => {
+      if (document.visibilityState === "hidden") return;
+      const gap = Date.now() - lastAutoSyncAt;
+      if (gap < AUTO_SYNC_MIN_GAP_MS && accessToken) return;
+      syncNow(false).catch(() => {});
+    }, RESUME_DEBOUNCE_MS);
+  }
+
+  function startAutoSyncLoop() {
+    if (demoMode || !hasClientId) return;
+    stopAutoSyncLoop();
+    pollTimer = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      if (!meta.signedIn) return;
+      if (!navigator.onLine) return;
+      syncNow(false).catch(() => {});
+    }, POLL_MS);
+  }
+
+  function stopAutoSyncLoop() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (resumeTimer) {
+      clearTimeout(resumeTimer);
+      resumeTimer = null;
+    }
+  }
+
+  function bindAutoSyncEvents() {
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") queueResumeSync("visibility");
+    });
+    window.addEventListener("focus", () => queueResumeSync("focus"));
+    window.addEventListener("pageshow", () => queueResumeSync("pageshow"));
+    window.addEventListener("online", () => {
+      updateChrome();
+      queueResumeSync("online");
+    });
+  }
+
+  async function trySilentBootSync() {
+    if (demoMode || !hasClientId || !meta.signedIn) return;
+    try {
+      setSyncState("syncing");
+      await ensureAccessToken({ interactive: false });
+      await refreshUserEmail();
+      await syncNow(false);
+      startAutoSyncLoop();
     } catch (e) {
-      console.error(e);
-      toast("同步錯誤：" + e.message, "error");
+      console.warn("silent boot sync", e);
+      setSyncState("need_login", e.message || "需要重新連線");
+      // Keep signedIn preference true so UI offers「重新連線」not full first-time story
     }
   }
 
   // ——— Boot ———
   async function boot() {
     if (!loadLocal()) {
-      // try fetch seed.json
       try {
         const r = await fetch("data/seed.json", { cache: "no-store" });
         if (r.ok) data = await r.json();
@@ -2773,15 +3035,12 @@
       b.onclick = () => switchView(b.dataset.nav);
     });
 
-    window.addEventListener("online", () => {
-      updateChrome();
-      if (meta.signedIn && accessToken) syncNow(false);
-    });
-
+    bindAutoSyncEvents();
     initGis();
     migrateData();
     runMonthRolloverIfNeeded();
     render();
+    trySilentBootSync();
 
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("sw.js").catch(() => {});
