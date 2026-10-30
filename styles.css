@@ -723,3 +723,103 @@ a {
   color: var(--accent-bright);
 }
 .list-actions .btn-paid { margin-right: 2px; }
+
+
+/* Free cash hero + money flow */
+.free-cash-card {
+  background: linear-gradient(165deg, #1a2e26 0%, var(--bg-card) 55%);
+  border-color: #2a5a45;
+}
+.free-cash-card .hero-amount {
+  font-size: 2.4rem;
+  margin: 4px 0 2px;
+}
+.plain-tip {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+.lock-box {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.lock-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 6px 0;
+  font-size: 0.9rem;
+}
+.lock-label { color: var(--text-muted); }
+.lock-amt {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.lock-out .lock-amt { color: var(--warn); }
+.lock-total {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  font-weight: 600;
+}
+.lock-total .lock-label { color: var(--text); }
+.flow-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.flow-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.9rem;
+  color: var(--text-muted);
+}
+.flow-list li:last-child { border-bottom: none; }
+.flow-list strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.flow-list .flow-emph {
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  color: var(--text);
+  font-weight: 600;
+}
+.flow-list .flow-emph strong { font-size: 1.05rem; }
+.more-details {
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  padding: 4px 12px 12px;
+}
+.more-details > summary {
+  cursor: pointer;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  color: var(--accent-bright);
+  font-size: 0.9rem;
+  font-weight: 600;
+  list-style: none;
+}
+.more-details > summary::-webkit-details-marker { display: none; }
+.more-details > summary::before {
+  content: "▸";
+  margin-right: 8px;
+  transition: transform 0.15s;
+}
+.more-details[open] > summary::before { transform: rotate(90deg); }
+.more-details .card { box-shadow: none; }
+.ledger-month-chips { margin: 0 0 10px; }
+.month-chip { margin-left: 0; margin-right: 0; }

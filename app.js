@@ -42,7 +42,13 @@
   let tokenClient = null;
   let accessToken = null;
   let gsiReady = false;
-  let leftMonthOffset = 0; // overview 估計剩錢 month selector (0 = this month); UI-only, not saved
+  let leftMonthOffset = 0; // overview 進階預測 month selector (0 = this month); UI-only, not saved
+  let ledgerMonthFilter = monthKeyNow(); // "YYYY-MM" or "" for 全部; UI-only
+
+  function monthKeyNow() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  }
 
   // ——— Seed (inline fallback; also loaded from data/seed.json on first run) ———
   const SEED = {
@@ -269,9 +275,10 @@
     return changed;
   }
 
-  function monthIncomeTotal() {
+  function monthIncomeTotal(mk) {
+    const prefix = mk || monthKey();
     return (data.transactions || [])
-      .filter((t) => isIncome(t) && isCurrentMonth(t.date))
+      .filter((t) => isIncome(t) && String(t.date || "").startsWith(prefix))
       .reduce((s, t) => s + (Number(t.amount) || 0), 0);
   }
 
@@ -793,6 +800,37 @@
     return (data.accounts || []).reduce((s, a) => s + (Number(a.balance) || 0), 0);
   }
 
+  /**
+   * Free / spendable cash right now (plain language 而家可以用):
+   *   戶口合計 − 本月未還固定 − 本月未還卡數
+   * Locked amounts are shown separately so they are NOT mixed into the hero number.
+   * This replaces the old opaque "估計剩錢" (salary − fixed − spend) as the primary figure.
+   */
+  function freeCashSnapshot(mk) {
+    const m = mk || monthKey();
+    const cash = accountsTotal();
+    const lockedSubs = sumSubs(m);
+    const lockedInst = sumInstalments(m);
+    const locked = lockedSubs + lockedInst;
+    const free = cash - locked;
+    const take = Number(data.profile.takeHome) || 0;
+    const incomeIn = monthIncomeTotal(m);
+    const discSpend = spendForMonthKey(m, true);
+    const allSpend = spendForMonthKey(m, false);
+    return {
+      month: m,
+      cash,
+      lockedSubs,
+      lockedInst,
+      locked,
+      free,
+      take,
+      incomeIn,
+      discSpend,
+      allSpend,
+    };
+  }
+
   // ——— Navigation ———
   function switchView(name) {
     currentView = name;
@@ -875,7 +913,7 @@
     return `
       <div class="card cat-totals-card">
         <h2>${esc(monthTitle(mk))}分類開支</h2>
-        <div class="hero-sub" style="margin-bottom:6px">跟上面剩錢同一個月份 · 只計支出記帳</div>
+        <div class="hero-sub" style="margin-bottom:6px">只計支出記帳</div>
         <ul class="list cat-totals-list">
           ${knownRows}
           ${extraRows}
@@ -894,6 +932,7 @@
   }
 
   function renderLeftoverCard(cap) {
+    /* Kept for optional 「進階預測」; no longer the overview hero. */
     const cur = monthKey();
     const mk = addMonths(cur, leftMonthOffset);
     const e = monthEstimate(mk);
@@ -924,83 +963,48 @@
           })
           .join("")
       : row('<span class="sub">冇</span>', "", "");
-    const spendLine = hasSpend
-      ? ` − 已記開支 ${money(e.otherSpend)}`
-      : "";
+    const spendLine = hasSpend ? ` − 已記開支 ${money(e.otherSpend)}` : "";
     const reflectedTag = hasSpend
       ? `<span class="tag muted reflected-tag">已反映記帳</span>`
       : `<span class="tag muted reflected-tag">預測</span>`;
-    const incomeNote =
-      e.actualIncome > 0 && Math.abs(e.actualIncome - e.income) > 0.5
-        ? row('<span class="sub">本月已入帳收入</span>', "參考；剩錢仍用預計實收計", `<span class="sub">${money(e.actualIncome)}</span>`)
-        : e.actualIncome > 0
-          ? row('<span class="sub">本月已入帳</span>', "", `<span class="sub">${money(e.actualIncome)}</span>`)
-          : "";
     return `
       <div class="card left-card">
         <div class="chips month-chips" role="tablist" aria-label="揀月份">${chips}</div>
-        <h2>估計 ${esc(monthTitle(mk))}剩錢 ${reflectedTag}</h2>
+        <h2>預測 ${esc(monthTitle(mk))}剩錢 ${reflectedTag}</h2>
         <div class="hero-amount ${e.left >= 0 ? "positive" : "negative"}">${money(e.left)}</div>
         <div class="hero-sub">實收 ${money(e.income)} − 固定 ${money(e.subsTotal)} − 分期／卡數 ${money(e.instTotal)}${spendLine}</div>
-        ${
-          hasSpend
-            ? `<div class="hero-sub">未計日常開支前：${money(e.forecast)}</div>`
-            : ""
-        }
-        <div class="hero-sub">扣埋開支目標 ${money(cap)} 後：<strong class="${afterCap >= 0 ? "pos-text" : "neg-text"}">${money(afterCap)}</strong></div>
+        <div class="hero-sub">扣開支目標 ${money(cap)} 後：<strong class="${afterCap >= 0 ? "pos-text" : "neg-text"}">${money(afterCap)}</strong></div>
         <details class="breakdown" id="leftDetails">
           <summary>睇計算明細</summary>
           <div class="bd-head"><span>收入</span><span>${money(e.income)}</span></div>
-          <ul class="list">
-            ${row("實收薪金（預計）", "", money(e.income))}
-            ${incomeNote}
-          </ul>
+          <ul class="list">${row("實收薪金（預計）", "", money(e.income))}</ul>
           <div class="bd-head"><span>固定開支</span><span>−${money(e.subsTotal)}</span></div>
           <ul class="list">${subRows}</ul>
           <div class="bd-head"><span>分期／卡數</span><span>−${money(e.instTotal)}</span></div>
           <ul class="list">${instRows}</ul>
           <div class="bd-head"><span>本月已記開支</span><span>−${money(e.otherSpend)}</span></div>
-          <ul class="list">
-            ${
-              hasSpend
-                ? row(`${e.otherCount} 筆日常開支`, "唔計「固定／卡數」類（避免重複）", "−" + money(e.otherSpend))
-                : row('<span class="sub">未有記帳（預測）</span>', "", "−" + money(0))
-            }
-          </ul>
-          ${
-            (e.paidSkipped || []).length
-              ? `<div class="bd-head"><span>已還（唔計入）</span><span>${e.paidSkipped.length} 項</span></div>
-          <ul class="list">${e.paidSkipped
-            .map((x) => row(`${esc(x.name)}<span class="tag muted">已還</span>`, esc(x.kind), money(x.amount), "muted-row"))
-            .join("")}</ul>`
-              : ""
-          }
-          <div class="bd-head bd-total"><span>剩錢</span><span>${money(e.left)}</span></div>
-          <p class="hero-sub bd-note">計法：實收 − 當月固定 − 當月到期分期 − 已記日常開支。已標「已還」嘅固定／分期唔計入。日常開支＝唔屬「固定／卡數」嘅支出。每兩個月項目只喺到期月計。分期按「剩餘期數」；結單金額只計嗰個月。</p>
+          <ul class="list">${
+            hasSpend
+              ? row(`${e.otherCount} 筆日常開支`, "唔計「固定／卡數」類", "−" + money(e.otherSpend))
+              : row('<span class="sub">未有記帳（預測）</span>', "", "−" + money(0))
+          }</ul>
+          <div class="bd-head bd-total"><span>預測剩錢</span><span>${money(e.left)}</span></div>
+          <p class="hero-sub bd-note">呢個係「出糧後仲剩幾多」預測，唔係而家戶口可以用嘅錢。主畫面嘅「而家可以用」先係真實可支配。</p>
         </details>
       </div>`;
   }
 
   function renderOverview() {
     const el = $("#view-overview");
-    const curEst = monthEstimate(monthKey());
-    const fixed = curEst.fixed;
-    const cap = Number(data.profile.monthlyCap) || 8000;
-    const room = cap - fixed; // often negative if fixed > cap — show discretionary room under 8000
-    // Interpreting prior advice: room under 8000 for discretionary = cap - fixed (can be negative)
-    // Also show spend vs 8000 target for this month's discretionary spend
-    const discSpend = monthSpendDiscretionary();
-    const allSpend = monthSpendAll();
-    const pct = Math.min(100, Math.round((discSpend / cap) * 100));
-    const over = discSpend > cap;
-    const dues = upcomingDues(14);
-    const take = data.profile.takeHome;
     const mk = monthKey();
-    const incomeMonth = monthIncomeTotal();
+    const cap = Number(data.profile.monthlyCap) || 8000;
+    const snap = freeCashSnapshot(mk);
+    const dues = upcomingDues(14);
+    const pct = Math.min(100, Math.round((snap.discSpend / Math.max(cap, 1)) * 100));
+    const over = snap.discSpend > cap;
+    const remainCap = cap - snap.discSpend;
+    const freeCls = snap.free >= 0 ? "positive" : "negative";
     const budgets = (data.profile && data.profile.categoryBudgets) || {};
-
-    const leftHtml = renderLeftoverCard(cap);
-
     const budgetRows = BUDGET_CATS.filter((c) => Number(budgets[c]) > 0)
       .map((c) => {
         const capB = Number(budgets[c]) || 0;
@@ -1020,56 +1024,45 @@
 
     el.innerHTML = `
       <div class="month-chip">本月 ${esc(mk)}</div>
-      ${leftHtml}
-      ${renderCategoryCard(addMonths(mk, leftMonthOffset))}
+
+      <div class="card free-cash-card">
+        <h2>而家可以用</h2>
+        <div class="hero-amount ${freeCls}">${money(snap.free)}</div>
+        <div class="hero-sub">戶口合計 − 未還固定 − 未還卡數</div>
+        <p class="plain-tip">呢個先係你而家真正可以花嘅錢。「已鎖住」係仲未還嘅固定同卡數。還咗記得撳「已還」；戶口結餘請喺「卡數」頁更新，數字先準。</p>
+        <div class="lock-box">
+          <div class="lock-row"><span class="lock-label">戶口合計</span><span class="lock-amt">${money(snap.cash)}</span></div>
+          <div class="lock-row lock-out"><span class="lock-label">未還固定開支</span><span class="lock-amt">−${money(snap.lockedSubs)}</span></div>
+          <div class="lock-row lock-out"><span class="lock-label">未還卡數／分期</span><span class="lock-amt">−${money(snap.lockedInst)}</span></div>
+          <div class="lock-row lock-total"><span class="lock-label">已鎖住（未還）</span><span class="lock-amt">${money(snap.locked)}</span></div>
+        </div>
+      </div>
+
+      <div class="card flow-card">
+        <h2>本月錢流（簡單）</h2>
+        <ul class="flow-list">
+          <li><span>薪金實收（設定）</span><strong>${money(snap.take)}</strong></li>
+          <li><span>本月已入帳收入</span><strong class="pos-text">${money(snap.incomeIn)}</strong></li>
+          <li><span>已用日常開支</span><strong>${money(snap.discSpend)}</strong></li>
+          <li><span>已鎖住（未還固定＋卡）</span><strong>${money(snap.locked)}</strong></li>
+          <li class="flow-emph"><span>而家可以用</span><strong class="${freeCls}">${money(snap.free)}</strong></li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h2>本月日常開支 vs 目標 ${money(cap)}</h2>
+        <div class="progress ${over ? "over" : ""}"><span style="width:${pct}%"></span></div>
+        <div class="progress-meta">
+          <span>已用 ${money(snap.discSpend)}</span>
+          <span>${over ? "超咗 " + money(snap.discSpend - cap) : "仲得 " + money(remainCap)}</span>
+        </div>
+        <div class="hero-sub" style="margin-top:8px">唔計固定／卡數類 · 記帳總額（含固定卡） ${money(snap.allSpend)}</div>
+      </div>
 
       <div class="card payroll-card">
         <h2>出糧入帳</h2>
-        <div class="hero-sub" style="margin-bottom:10px">一鍵將實收薪金記入戶口（收入）</div>
+        <div class="hero-sub" style="margin-bottom:10px">一鍵將實收薪金記入戶口</div>
         <button type="button" class="btn btn-primary" id="btnPayroll">出糧入帳</button>
-        <div class="hero-sub" style="margin-top:10px">本月已入帳收入 ${money(incomeMonth)}</div>
-      </div>
-
-      <div class="card">
-        <h2>本月開支 vs 目標 HK$8,000</h2>
-        <div class="progress ${over ? "over" : ""}"><span style="width:${pct}%"></span></div>
-        <div class="progress-meta">
-          <span>已用（非固定／卡數）${money(discSpend)}</span>
-          <span>${pct}%</span>
-        </div>
-        <div class="hero-sub" style="margin-top:8px">
-          固定＋分期共 ${money(fixed)} · 目標下可動用空間 ${money(room)}
-          ${room < 0 ? "（固定已超目標）" : ""}
-        </div>
-        <div class="hero-sub">本月記帳總額 ${money(allSpend)}</div>
-      </div>
-
-      <div class="card">
-        <h2>分類預算</h2>
-        ${
-          budgetRows
-            ? budgetRows
-            : `<div class="empty">未設定分類預算 — 去「設定」加入</div>`
-        }
-      </div>
-
-      <div class="grid-2">
-        <div class="stat-tile">
-          <div class="label">戶口合計</div>
-          <div class="value">${money(accountsTotal())}</div>
-        </div>
-        <div class="stat-tile">
-          <div class="label">固定開支</div>
-          <div class="value">${money(sumSubs())}</div>
-        </div>
-        <div class="stat-tile">
-          <div class="label">卡數分期／月</div>
-          <div class="value">${money(sumInstalments())}</div>
-        </div>
-        <div class="stat-tile">
-          <div class="label">實收薪金</div>
-          <div class="value">${money(take)}</div>
-        </div>
       </div>
 
       <div class="section-title"><span>即將到期（14 日內）</span></div>
@@ -1091,6 +1084,24 @@
             : `<div class="empty">14 日內無到期項目</div>`
         }
       </div>
+
+      <details class="more-details">
+        <summary>分類開支同預算</summary>
+        ${renderCategoryCard(mk)}
+        <div class="card" style="margin-top:0">
+          <h2>分類預算</h2>
+          ${
+            budgetRows
+              ? budgetRows
+              : `<div class="empty">未設定分類預算 — 去「設定」加入</div>`
+          }
+        </div>
+      </details>
+
+      <details class="more-details" id="advForecast">
+        <summary>進階：出糧後剩錢預測（唔係而家可用）</summary>
+        ${renderLeftoverCard(cap)}
+      </details>
     `;
 
     const btnPay = $("#btnPayroll");
@@ -1099,7 +1110,9 @@
       b.onclick = () => {
         leftMonthOffset = parseInt(b.dataset.leftOffset, 10) || 0;
         const open = !!($("#leftDetails") && $("#leftDetails").open);
+        const advOpen = !!($("#advForecast") && $("#advForecast").open);
         renderOverview();
+        if (advOpen && $("#advForecast")) $("#advForecast").open = true;
         if (open && $("#leftDetails")) $("#leftDetails").open = true;
       };
     });
@@ -1174,11 +1187,31 @@
 
   function renderLedger() {
     const el = $("#view-ledger");
-    const txs = [...(data.transactions || [])].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+    const allTxs = [...(data.transactions || [])].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+    const cur = monthKey();
+    // Build month options: current + previous 5 that have txs, plus 全部
+    const monthSet = new Set(allTxs.map((t) => String(t.date || "").slice(0, 7)).filter((m) => m.length === 7));
+    monthSet.add(cur);
+    const months = [...monthSet].sort().reverse().slice(0, 8);
+    if (ledgerMonthFilter && ledgerMonthFilter !== "" && !months.includes(ledgerMonthFilter)) {
+      months.unshift(ledgerMonthFilter);
+    }
+    const filter = ledgerMonthFilter; // "" = all
+    const txs = filter ? allTxs.filter((t) => String(t.date || "").startsWith(filter)) : allTxs;
+    const monthChips =
+      `<button type="button" class="chip ${filter === "" ? "active" : ""}" data-ledger-month="">全部</button>` +
+      months
+        .map((m) => {
+          const [y, mm] = m.split("-").map((x) => parseInt(x, 10));
+          const label = y === new Date().getFullYear() ? `${mm}月` : `${String(y).slice(2)}/${mm}`;
+          return `<button type="button" class="chip ${filter === m ? "active" : ""}" data-ledger-month="${esc(m)}">${label}</button>`;
+        })
+        .join("");
 
     el.innerHTML = `
       <div class="card">
-        <h2>快速記帳</h2>
+        <h2>記一筆開支</h2>
+        <div class="hero-sub" style="margin-bottom:10px">金額 · 類別 · 備註 · 日期，幾秒搞掂</div>
         <div class="form-row">
           <label>類型</label>
           <div class="chips" id="typeChips">
@@ -1215,7 +1248,8 @@
       </div>
 
       ${mealSummaryHtml()}
-      <div class="section-title"><span>最近交易</span><span>${txs.length} 筆</span></div>
+      <div class="section-title"><span>紀錄</span><span>${txs.length} 筆</span></div>
+      <div class="chips month-chips ledger-month-chips" role="tablist" aria-label="按月份篩選">${monthChips}</div>
       <div class="card" style="padding:4px 12px">
         ${
           txs.length
@@ -1223,7 +1257,7 @@
                 .map((t) => {
                   const inc = isIncome(t);
                   const amtCls = inc ? "amt in" : "amt out";
-                  const amtTxt = inc ? "+" + money(t.amount) : money(t.amount);
+                  const amtTxt = inc ? "+" + money(t.amount) : "−" + money(t.amount);
                   const typeTag = inc ? "收入" : "支出";
                   return `
               <li class="list-item" data-id="${esc(t.id)}">
@@ -1239,7 +1273,7 @@
               </li>`;
                 })
                 .join("")}</ul>`
-            : `<div class="empty">未有交易</div>`
+            : `<div class="empty">${filter ? "呢個月未有紀錄" : "未有交易"}</div>`
         }
       </div>
     `;
@@ -1287,6 +1321,12 @@
     $("#btnAddTx").onclick = () => addTransaction();
     $$("[data-del-tx]").forEach((b) => (b.onclick = () => deleteTx(b.dataset.delTx)));
     $$("[data-edit-tx]").forEach((b) => (b.onclick = () => openEditTx(b.dataset.editTx)));
+    $$("[data-ledger-month]").forEach((b) => {
+      b.onclick = () => {
+        ledgerMonthFilter = b.dataset.ledgerMonth || "";
+        renderLedger();
+      };
+    });
   }
 
   function wireChips(sel) {
