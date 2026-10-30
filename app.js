@@ -2164,8 +2164,10 @@
         <p>上次同步：<span class="mono">${esc(last)}</span></p>
         <p>本地更新：<span class="mono">${esc(data.updatedAt || "—")}</span></p>
         <p class="hero-sub">開住畫面時約每 45 秒會拉 Drive 合併兩邊改動（唔會成個檔覆蓋）。完全閂咗 App 就唔會喺背後同步（PWA 限制）。刪咗嘅記錄如果另一邊仲喺度，合併時可能會返嚟。</p>
+        <p class="plain-tip">如果出現「Fail to open the pop up window」／彈窗被擋：撳「全頁登入（唔使彈窗）」；或者允許呢個網站開彈窗之後再試。</p>
         <div class="btn-row" style="flex-direction:column">
           <button type="button" class="btn btn-primary" id="btnLogin" ${demoMode && !hasClientId ? "disabled" : ""}>${meta.signedIn && syncState === "need_login" ? "重新連線 Google" : meta.signedIn ? "重新授權（通常唔使）" : "登入 Google（只需一次）"}</button>
+          <button type="button" class="btn btn-secondary" id="btnLoginRedirect" ${demoMode && !hasClientId ? "disabled" : ""}>全頁登入（唔使彈窗）</button>
           <button type="button" class="btn btn-secondary" id="btnSyncNow" ${!meta.signedIn ? "disabled" : ""}>立即同步</button>
           <button type="button" class="btn btn-ghost" id="btnLogout" ${!meta.signedIn ? "disabled" : ""}>登出</button>
         </div>
@@ -2244,7 +2246,10 @@
       </div>
     `;
 
-    $("#btnLogin").onclick = () => googleLogin({ forceConsent: syncState === "need_login" });
+    $("#btnLogin").onclick = () =>
+      googleLogin({ forceConsent: syncState === "need_login", redirect: !!meta.preferRedirectLogin });
+    const btnRedir = $("#btnLoginRedirect");
+    if (btnRedir) btnRedir.onclick = () => googleLogin({ forceConsent: true, redirect: true });
     $("#btnSyncNow").onclick = () => syncNow(true);
     $("#btnLogout").onclick = () => googleLogout();
     $("#btnSaveProfile").onclick = () => {
@@ -2923,8 +2928,111 @@
     waitForGis().catch((e) => console.warn("initGis", e));
   }
 
+  const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+  const OAUTH_STATE_KEY = "fanance-oauth-state";
+
+  /** Canonical redirect URI for this Pages deploy (must be in Google Cloud → Authorized redirect URIs). */
+  function oauthRedirectUri() {
+    if (CFG.OAUTH_REDIRECT_URI) return String(CFG.OAUTH_REDIRECT_URI);
+    const u = new URL(location.href);
+    let path = u.pathname || "/";
+    if (/index\.html$/i.test(path)) path = path.replace(/index\.html$/i, "");
+    if (!path.endsWith("/")) path += "/";
+    return u.origin + path;
+  }
+
+  function isPopupBlockedError(err) {
+    const msg = String((err && err.message) || err || "");
+    return /popup|Fail to open|Failed to open|blocked|window\.open|user_agent_denied|immediate_failed/i.test(
+      msg
+    );
+  }
+
+  function applyAccessToken(token, expiresInSec) {
+    accessToken = token;
+    const expSec = Number(expiresInSec) || 3600;
+    tokenExpiresAt = Date.now() + expSec * 1000;
+    meta.signedIn = true;
+    saveLocal();
+  }
+
   /**
-   * Request an access token via GIS Token Client.
+   * Full-page OAuth (implicit token) — no popup. Used when GIS popup is blocked.
+   * Lands back on redirect_uri with #access_token=...
+   */
+  function beginOAuthRedirect(opts) {
+    if (!hasClientId) {
+      toast("請先喺 config.js 填 GOOGLE_CLIENT_ID", "error");
+      return;
+    }
+    const silent = !!(opts && opts.silent);
+    const forceConsent = !!(opts && opts.forceConsent);
+    const state = uid("oauth");
+    try {
+      sessionStorage.setItem(OAUTH_STATE_KEY, state);
+      sessionStorage.setItem("fanance-oauth-pending", "1");
+    } catch (_) {}
+    const params = new URLSearchParams({
+      client_id: CFG.GOOGLE_CLIENT_ID,
+      redirect_uri: oauthRedirectUri(),
+      response_type: "token",
+      scope: DRIVE_SCOPE,
+      include_granted_scopes: "true",
+      state,
+    });
+    if (silent) params.set("prompt", "none");
+    else if (forceConsent) params.set("prompt", "consent");
+    setSyncState("syncing");
+    toast(silent ? "嘗試靜默登入…" : "轉去 Google 全頁登入（唔使彈窗）…", "ok");
+    location.assign("https://accounts.google.com/o/oauth2/v2/auth?" + params.toString());
+  }
+
+  /**
+   * If URL has OAuth redirect result (#access_token or ?error), consume it and clean the URL.
+   * Returns { ok:true } | { error } | null (no oauth callback).
+   */
+  function consumeOAuthRedirect() {
+    const hash = (location.hash || "").replace(/^#/, "");
+    const q = (location.search || "").replace(/^\?/, "");
+    if (!hash && !q) return null;
+    const hp = hash ? new URLSearchParams(hash) : null;
+    const qp = q ? new URLSearchParams(q) : null;
+    const token = (hp && hp.get("access_token")) || null;
+    const error = (hp && hp.get("error")) || (qp && qp.get("error")) || null;
+    const state = (hp && hp.get("state")) || (qp && qp.get("state")) || null;
+    const expiresIn = (hp && hp.get("expires_in")) || null;
+    if (!token && !error) return null;
+
+    let expected = null;
+    try {
+      expected = sessionStorage.getItem(OAUTH_STATE_KEY);
+      sessionStorage.removeItem(OAUTH_STATE_KEY);
+      sessionStorage.removeItem("fanance-oauth-pending");
+    } catch (_) {}
+
+    // Strip hash/query oauth params from address bar (keep path)
+    try {
+      history.replaceState({}, "", oauthRedirectUri());
+    } catch (_) {
+      try {
+        history.replaceState({}, "", location.pathname);
+      } catch (__) {}
+    }
+
+    if (error) {
+      return { error: String(error) };
+    }
+    if (expected && state && expected !== state) {
+      return { error: "state_mismatch" };
+    }
+    applyAccessToken(token, expiresIn);
+    meta.preferRedirectLogin = true; // popup was problematic; prefer redirect next time
+    saveLocal();
+    return { ok: true };
+  }
+
+  /**
+   * Request an access token via GIS Token Client (popup).
    * prompt "" = silent renew when possible; "consent" only when needed.
    */
   function requestAccessToken(prompt) {
@@ -2937,11 +3045,7 @@
             reject(Object.assign(new Error((resp && resp.error) || "token_error"), { resp }));
             return;
           }
-          accessToken = resp.access_token;
-          const expSec = Number(resp.expires_in) || 3600;
-          tokenExpiresAt = Date.now() + expSec * 1000;
-          meta.signedIn = true;
-          saveLocal();
+          applyAccessToken(resp.access_token, resp.expires_in);
           resolve(resp);
         };
         tokenClient.error_callback = (err) => {
@@ -2966,7 +3070,7 @@
 
   /**
    * Ensure we have a usable access token.
-   * Tries silent renew first; only interactive/consent when asked or silent fails + interactive.
+   * Silent path: GIS prompt "" only (no redirect flash). Interactive: GIS then caller may redirect.
    */
   async function ensureAccessToken(opts) {
     const interactive = !!(opts && opts.interactive);
@@ -2989,12 +3093,19 @@
           setSyncState("need_login", e.message || "靜默續期失敗");
           throw e;
         }
-        // interactive: fall through to consent once
+        // interactive: fall through to consent popup once
       }
     }
-    await requestAccessToken("consent");
-    setSyncState("ok");
-    return accessToken;
+    try {
+      await requestAccessToken("consent");
+      setSyncState("ok");
+      return accessToken;
+    } catch (e) {
+      if (isPopupBlockedError(e)) {
+        e.popupBlocked = true;
+      }
+      throw e;
+    }
   }
 
   async function refreshUserEmail() {
@@ -3020,9 +3131,14 @@
       toast("請先喺 config.js 填 GOOGLE_CLIENT_ID", "error");
       return;
     }
+    const forceConsent = !!(opts && opts.forceConsent) || !meta.signedIn;
+    const useRedirect = !!(opts && opts.redirect) || !!meta.preferRedirectLogin;
+    if (useRedirect) {
+      beginOAuthRedirect({ forceConsent: true });
+      return;
+    }
     try {
       setSyncState("syncing");
-      const forceConsent = !!(opts && opts.forceConsent) || !meta.signedIn;
       await ensureAccessToken({ interactive: true, forceConsent });
       await refreshUserEmail();
       toast(forceConsent ? "已登入 Google — 之後會自動同步" : "已重新連線", "ok");
@@ -3031,8 +3147,17 @@
       render();
     } catch (e) {
       console.error(e);
+      if (isPopupBlockedError(e) || e.popupBlocked) {
+        meta.preferRedirectLogin = true;
+        saveLocal();
+        setSyncState("need_login", "彈窗被擋");
+        toast("彈窗開唔到，改用全頁登入…", "ok");
+        render();
+        setTimeout(() => beginOAuthRedirect({ forceConsent: true }), 400);
+        return;
+      }
       setSyncState("need_login", e.message || "登入失敗");
-      toast("登入失敗：" + (e.message || e), "error");
+      toast("登入失敗：" + (e.message || e) + " — 可試「全頁登入」", "error");
       render();
     }
   }
@@ -3043,6 +3168,7 @@
     tokenExpiresAt = 0;
     meta.signedIn = false;
     meta.email = null;
+    // keep preferRedirectLogin so next login uses working method
     saveLocal();
     stopAutoSyncLoop();
     setSyncState("idle");
@@ -3355,8 +3481,38 @@
     initGis();
     migrateData();
     runMonthRolloverIfNeeded();
+
+    const oauthResult = consumeOAuthRedirect();
     render();
-    trySilentBootSync();
+
+    if (oauthResult && oauthResult.ok) {
+      setSyncState("syncing");
+      toast("已用全頁登入 Google", "ok");
+      try {
+        await refreshUserEmail();
+        await syncNow(true);
+        startAutoSyncLoop();
+      } catch (e) {
+        console.warn("post-redirect sync", e);
+        setSyncState("error", e.message || "同步失敗");
+        toast("登入成功但同步失敗：" + (e.message || e), "error");
+      }
+      render();
+    } else if (oauthResult && oauthResult.error) {
+      const err = oauthResult.error;
+      if (err === "access_denied") {
+        setSyncState("need_login", "你取消咗登入");
+        toast("已取消 Google 登入", "error");
+      } else if (err === "interaction_required" || err === "login_required") {
+        setSyncState("need_login", "需要重新登入");
+        toast("需要重新登入 — 請撳「全頁登入」", "error");
+      } else {
+        setSyncState("need_login", err);
+        toast("Google 登入失敗：" + err + " — 可試「全頁登入」", "error");
+      }
+    } else {
+      trySilentBootSync();
+    }
 
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("sw.js").catch(() => {});
