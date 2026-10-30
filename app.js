@@ -19,7 +19,13 @@
     "寵物": 500,
     "其他": 800,
   };
-  const ACCOUNT_NAMES = ["現金", "其他"]; // generic fallbacks; real account names come from data.accounts
+  const ACCOUNT_NAMES = ["八達通", "enJoy", "現金", "其他"]; // fallbacks; real names come from data.accounts
+  const PREFERRED_ACCOUNT_ORDER = ["八達通", "enJoy", "現金"];
+  /** Accounts that must exist for every user (added by migrate; never wipe balances). */
+  const REQUIRED_ACCOUNTS = [
+    { id: "acc-octopus", name: "八達通", balance: 0, kind: "wallet", notes: "日常拍卡／交通" },
+    { id: "acc-enjoy", name: "enJoy", balance: 0, kind: "card", notes: "恒生 enJoy；入八達通多用呢張" },
+  ];
 
   const CFG = Object.assign(
     {
@@ -76,23 +82,43 @@
         "id": "acc-bank1",
         "name": "銀行 A",
         "balance": 5000,
-        "asOf": "2026-09-01"
+        "asOf": "2026-09-01",
+        "kind": "bank"
       },
       {
         "id": "acc-bank2",
         "name": "銀行 B",
         "balance": 1200,
-        "asOf": "2026-09-01"
+        "asOf": "2026-09-01",
+        "kind": "bank"
+      },
+      {
+        "id": "acc-octopus",
+        "name": "八達通",
+        "balance": 100,
+        "asOf": "2026-09-01",
+        "kind": "wallet",
+        "notes": "示範錢包，非真實結餘"
+      },
+      {
+        "id": "acc-enjoy",
+        "name": "enJoy",
+        "balance": 0,
+        "asOf": "2026-09-01",
+        "kind": "card",
+        "notes": "示範信用卡戶口標籤；唔計入「而家可以用」"
       },
       {
         "id": "acc-cash",
         "name": "現金",
-        "balance": 300
+        "balance": 300,
+        "kind": "bank"
       },
       {
         "id": "acc-other",
         "name": "其他",
-        "balance": 0
+        "balance": 0,
+        "kind": "bank"
       }
     ],
     "cards": [
@@ -175,7 +201,60 @@
     [...(data && data.accounts ? data.accounts.map((a) => a.name) : []), ...ACCOUNT_NAMES].forEach((n) => {
       if (n && !out.includes(n)) out.push(n);
     });
-    return out;
+    const rank = (n) => {
+      const i = PREFERRED_ACCOUNT_ORDER.indexOf(n);
+      return i >= 0 ? i : 100 + out.indexOf(n);
+    };
+    return out.slice().sort((a, b) => rank(a) - rank(b));
+  }
+
+  function accountByName(name) {
+    return (data.accounts || []).find((a) => a.name === name) || null;
+  }
+
+  function accountKind(name) {
+    const a = accountByName(name);
+    return (a && a.kind) || "bank";
+  }
+
+  /** Cash pools for「而家可以用」— exclude credit-card-style pots like enJoy. */
+  function isCashPoolAccount(a) {
+    if (!a) return false;
+    return a.kind !== "card";
+  }
+
+  /** Ensure 八達通 / enJoy exist; never wipe existing balances or txs. */
+  function ensureRequiredAccounts() {
+    if (!data) return false;
+    if (!Array.isArray(data.accounts)) data.accounts = [];
+    let changed = false;
+    REQUIRED_ACCOUNTS.forEach((spec) => {
+      const existing = data.accounts.find((a) => a.name === spec.name || a.id === spec.id);
+      if (!existing) {
+        data.accounts.push({
+          id: spec.id,
+          name: spec.name,
+          balance: 0,
+          kind: spec.kind,
+          notes: spec.notes || "",
+          asOf: todayISO(),
+        });
+        changed = true;
+        return;
+      }
+      if (!existing.kind && spec.kind) {
+        existing.kind = spec.kind;
+        changed = true;
+      }
+      if (existing.name !== spec.name) {
+        /* keep user-facing name if they renamed id collision — only patch kind */
+      }
+      if (spec.notes && !existing.notes) {
+        existing.notes = spec.notes;
+        changed = true;
+      }
+    });
+    return changed;
   }
 
   function money(n) {
@@ -264,6 +343,7 @@
   function migrateData() {
     let changed = false;
     if (ensureCategoryBudgets()) changed = true;
+    if (ensureRequiredAccounts()) changed = true;
     (data.transactions || []).forEach((t) => {
       if (t.type == null) {
         /* legacy = expense; leave unset for backward-compatible reads via isExpense */
@@ -797,6 +877,12 @@
   }
 
   function accountsTotal() {
+    return (data.accounts || [])
+      .filter(isCashPoolAccount)
+      .reduce((s, a) => s + (Number(a.balance) || 0), 0);
+  }
+
+  function accountsTotalAll() {
     return (data.accounts || []).reduce((s, a) => s + (Number(a.balance) || 0), 0);
   }
 
@@ -1029,7 +1115,7 @@
         <h2>而家可以用</h2>
         <div class="hero-amount ${freeCls}">${money(snap.free)}</div>
         <div class="hero-sub">戶口合計 − 未還固定 − 未還卡數</div>
-        <p class="plain-tip">呢個先係你而家真正可以花嘅錢。「已鎖住」係仲未還嘅固定同卡數。還咗記得撳「已還」；戶口結餘請喺「卡數」頁更新，數字先準。</p>
+        <p class="plain-tip">呢個先係你而家真正可以花嘅錢。「已鎖住」係仲未還嘅固定同卡數。還咗記得撳「已還」；戶口結餘請喺「卡數」頁更新。八達通計入可用錢；enJoy 只係付款標籤（唔計入合計）。</p>
         <div class="lock-box">
           <div class="lock-row"><span class="lock-label">戶口合計</span><span class="lock-amt">${money(snap.cash)}</span></div>
           <div class="lock-row lock-out"><span class="lock-label">未還固定開支</span><span class="lock-amt">−${money(snap.lockedSubs)}</span></div>
@@ -1211,7 +1297,8 @@
     el.innerHTML = `
       <div class="card">
         <h2>記一筆開支</h2>
-        <div class="hero-sub" style="margin-bottom:10px">金額 · 類別 · 備註 · 日期，幾秒搞掂</div>
+        <div class="hero-sub" style="margin-bottom:10px">金額 · 類別 · 戶口 · 備註 · 日期</div>
+        <p class="plain-tip ledger-tip">八達通拍卡 → 戶口揀「八達通」。用 enJoy 入八達通 → 戶口揀「enJoy」、備註寫「入八達通」（會自動加返八達通結餘）。</p>
         <div class="form-row">
           <label>類型</label>
           <div class="chips" id="typeChips">
@@ -1231,9 +1318,9 @@
         </div>
         ${mealRowHtml("txMealRow", "", CATEGORIES[0] === MEAL_CATEGORY)}
         <div class="form-row">
-          <label>戶口</label>
+          <label>戶口（邊個袋出錢）</label>
           <div class="chips" id="accChips">
-            ${accountNames().map((c, i) => `<button type="button" class="chip ${i === 0 ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`).join("")}
+            ${accountNames().map((c, i) => `<button type="button" class="chip ${c === "八達通" || (i === 0 && !accountNames().includes("八達通")) ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`).join("")}
           </div>
         </div>
         <div class="form-row">
@@ -1242,9 +1329,10 @@
         </div>
         <div class="form-row">
           <label>備註（可選）</label>
-          <input class="input" type="text" id="txNote" placeholder="例如：午餐" maxlength="80" />
+          <input class="input" type="text" id="txNote" placeholder="例如：午餐／入八達通" maxlength="80" />
         </div>
         <button type="button" class="btn btn-primary" id="btnAddTx">記一筆</button>
+        <button type="button" class="btn btn-secondary" id="btnOctopusTopup" style="margin-top:8px">快捷：enJoy 入八達通</button>
       </div>
 
       ${mealSummaryHtml()}
@@ -1318,7 +1406,75 @@
       };
     }
     wireMealChips("#txMealRow", "#catRow", "#txNote", "#typeChips");
+    const suggestAccountForCat = () => {
+      const typ = chipValue("#typeChips") || "expense";
+      const cat = chipValue("#catChips");
+      const box = $("#accChips");
+      if (!box || typ === "income") return;
+      let prefer = "";
+      if (cat === "交通") prefer = "八達通";
+      if (!prefer || !accountNames().includes(prefer)) return;
+      $$(".chip", box).forEach((c) => c.classList.toggle("active", c.dataset.val === prefer));
+    };
+    const catBox = $("#catChips");
+    if (catBox) {
+      const prevCat = catBox.onclick;
+      catBox.onclick = (e) => {
+        if (typeof prevCat === "function") prevCat(e);
+        else {
+          const btn = e.target.closest(".chip");
+          if (!btn) return;
+          $$(".chip", catBox).forEach((c) => c.classList.remove("active"));
+          btn.classList.add("active");
+        }
+        setTimeout(suggestAccountForCat, 0);
+      };
+    }
+    // Re-bind after type switches rebuild cat chips
+    const typeBox2 = $("#typeChips");
+    if (typeBox2) {
+      const prevType = typeBox2.onclick;
+      typeBox2.onclick = (e) => {
+        if (typeof prevType === "function") prevType(e);
+        setTimeout(() => {
+          const catBox2 = $("#catChips");
+          if (catBox2) {
+            catBox2.addEventListener("click", () => setTimeout(suggestAccountForCat, 0));
+          }
+          suggestAccountForCat();
+        }, 0);
+      };
+    }
     $("#btnAddTx").onclick = () => addTransaction();
+    const btnTop = $("#btnOctopusTopup");
+    if (btnTop) {
+      btnTop.onclick = () => {
+        // Prefill: expense / 交通 / enJoy / note 入八達通
+        const typeBox = $("#typeChips");
+        if (typeBox) {
+          $$(".chip", typeBox).forEach((c) => c.classList.toggle("active", c.dataset.val === "expense"));
+        }
+        const catRow = $("#catRow");
+        if (catRow) {
+          catRow.innerHTML = `<label>類別</label><div class="chips" id="catChips">${CATEGORIES.map(
+            (c) =>
+              `<button type="button" class="chip ${c === "交通" ? "active" : ""}" data-val="${esc(c)}">${esc(c)}</button>`
+          ).join("")}</div>`;
+          wireChips("#catChips");
+          const catBox3 = $("#catChips");
+          if (catBox3) catBox3.addEventListener("click", () => setTimeout(suggestAccountForCat, 0));
+        }
+        const accBox = $("#accChips");
+        if (accBox) {
+          $$(".chip", accBox).forEach((c) => c.classList.toggle("active", c.dataset.val === "enJoy"));
+        }
+        const note = $("#txNote");
+        if (note) note.value = "入八達通";
+        const amt = $("#txAmount");
+        if (amt) amt.focus();
+        toast("已填好：enJoy → 入八達通，輸入金額再撳記一筆", "ok");
+      };
+    }
     $$("[data-del-tx]").forEach((b) => (b.onclick = () => deleteTx(b.dataset.delTx)));
     $$("[data-edit-tx]").forEach((b) => (b.onclick = () => openEditTx(b.dataset.editTx)));
     $$("[data-ledger-month]").forEach((b) => {
@@ -1432,6 +1588,28 @@
     return { out, total };
   }
 
+  function isOctopusTopupNote(note) {
+    return /入八達通|增值八達通|八達通增值/.test(String(note || ""));
+  }
+
+  /** Apply balance side-effects for a tx (income / wallet spend / enJoy→八達通 top-up). */
+  function applyTxBalanceEffects(tx, direction) {
+    /* direction +1 = apply as recorded; -1 = reverse */
+    const amt = (Number(tx.amount) || 0) * direction;
+    if (!amt) return;
+    if (isIncome(tx)) {
+      adjustAccountBalance(tx.account, amt);
+      return;
+    }
+    if (accountKind(tx.account) === "wallet") {
+      adjustAccountBalance(tx.account, -amt);
+    }
+    if (tx.octopusTopup || (tx.account === "enJoy" && isOctopusTopupNote(tx.note))) {
+      adjustAccountBalance("八達通", amt);
+      tx.octopusTopup = true;
+    }
+  }
+
   function addTransaction() {
     const amount = parseFloat($("#txAmount").value);
     if (!amount || amount <= 0) {
@@ -1451,12 +1629,20 @@
     };
     const meal = !isInc && tx.category === MEAL_CATEGORY ? mealValue("#txMealRow") : "";
     if (meal) tx.sub = meal;
-    data.transactions.push(tx);
-    if (isInc) {
-      adjustAccountBalance(tx.account, amount);
+    if (!isInc && tx.account === "enJoy" && isOctopusTopupNote(tx.note)) {
+      tx.octopusTopup = true;
     }
+    data.transactions.push(tx);
+    applyTxBalanceEffects(tx, +1);
     touchUpdated();
-    toast(isInc ? "已記收入" : "已記帳", "ok");
+    toast(
+      tx.octopusTopup
+        ? `已記 enJoy 入八達通 ${money(amount)}`
+        : isInc
+          ? "已記收入"
+          : "已記帳",
+      "ok"
+    );
     if (!isInc) maybeBudgetToast(tx.category);
     renderLedger();
   }
@@ -1464,9 +1650,7 @@
   function deleteTx(id) {
     if (!confirm("刪除呢筆交易？")) return;
     const t = data.transactions.find((x) => x.id === id);
-    if (t && isIncome(t)) {
-      adjustAccountBalance(t.account, -(Number(t.amount) || 0));
-    }
+    if (t) applyTxBalanceEffects(t, -1);
     data.transactions = data.transactions.filter((x) => x.id !== id);
     touchUpdated();
     toast("已刪除", "ok");
@@ -1538,13 +1722,18 @@
     wireMealChips("#eMealRow", "#eCatRow", "#eNote", "#eType");
     $("#eCancel").onclick = closeSheet;
     $("#eSave").onclick = () => {
-      const prevAmt = Number(t.amount) || 0;
-      const prevAcc = t.account;
-      const prevInc = isIncome(t);
+      const prevSnap = {
+        amount: Number(t.amount) || 0,
+        account: t.account,
+        type: t.type,
+        note: t.note,
+        octopusTopup: !!t.octopusTopup,
+      };
       const newType = chipValue("#eType") || "expense";
       const newInc = newType === "income";
       const newAmt = parseFloat($("#eAmount").value) || t.amount;
       const newAcc = chipValue("#eAcc") || t.account;
+      applyTxBalanceEffects(prevSnap, -1);
       t.amount = newAmt;
       t.category = newInc ? INCOME_CATEGORY : chipValue("#eCat") || t.category;
       t.account = newAcc;
@@ -1554,9 +1743,10 @@
       if (newMeal) t.sub = newMeal;
       else delete t.sub;
       t.type = newInc ? "income" : "expense";
-      // Rebalance accounts if income side changed
-      if (prevInc) adjustAccountBalance(prevAcc, -prevAmt);
-      if (newInc) adjustAccountBalance(newAcc, newAmt);
+      if (!newInc && (t.account === "enJoy" && isOctopusTopupNote(t.note))) t.octopusTopup = true;
+      else if (!newInc && !isOctopusTopupNote(t.note)) delete t.octopusTopup;
+      else if (newInc) delete t.octopusTopup;
+      applyTxBalanceEffects(t, +1);
       touchUpdated();
       closeSheet();
       toast("已更新", "ok");
@@ -1783,23 +1973,26 @@
       <div class="card" style="padding:4px 12px">
         <ul class="list">
           ${(data.accounts || [])
-            .filter((a) => a.balance || a.asOf)
             .map(
-              (a) => `
+              (a) => {
+                const kind = a.kind || "bank";
+                const kindLabel = kind === "wallet" ? "錢包" : kind === "card" ? "信用卡標籤（唔計入可用）" : "銀行／現金";
+                return `
             <li class="list-item">
               <div class="meta">
-                <div class="title">${esc(a.name)}</div>
-                <div class="sub">${a.asOf ? "截至 " + esc(a.asOf) : ""}</div>
+                <div class="title">${esc(a.name)}${kind === "card" ? '<span class="tag muted">唔計可用</span>' : ""}</div>
+                <div class="sub">${kindLabel}${a.asOf ? " · 截至 " + esc(a.asOf) : ""}${a.notes ? " · " + esc(a.notes) : ""}</div>
               </div>
               <div class="amt">${money(a.balance)}</div>
               <div class="list-actions">
                 <button type="button" class="icon-btn" data-edit-acc="${esc(a.id)}">✎</button>
               </div>
-            </li>`
+            </li>`;
+              }
             )
             .join("")}
         </ul>
-        <div class="list-item"><div class="meta"><div class="title">合計</div></div><div class="amt">${money(accountsTotal())}</div></div>
+        <div class="list-item"><div class="meta"><div class="title">可用合計（唔計信用卡標籤）</div></div><div class="amt">${money(accountsTotal())}</div></div>
       </div>
     `;
 
@@ -2054,8 +2247,7 @@
           const parsed = JSON.parse(reader.result);
           if (!parsed || typeof parsed !== "object" || !parsed.profile) throw new Error("格式唔啱");
           data = parsed;
-          ensureCategoryBudgets();
-          touchUpdated();
+          migrateData();
           runMonthRolloverIfNeeded();
           toast("已匯入", "ok");
           render();
@@ -2184,6 +2376,7 @@
 
   /** Pure planning step: what would be added / skipped. Does not mutate data. */
   function planMerge(payload) {
+    ensureRequiredAccounts();
     let txIn = [];
     let subsIn = [];
     let instIn = [];
@@ -2243,12 +2436,14 @@
     return plan;
   }
 
-  /** Apply a plan exactly like manual adds (income adjusts balance, expense doesn't). */
+  /** Apply a plan with same balance side-effects as manual 記帳. */
   function applyMergePlan(plan) {
+    ensureRequiredAccounts();
     if (!data.transactions) data.transactions = [];
     plan.tx.forEach((t) => {
+      if (!isIncome(t) && t.account === "enJoy" && isOctopusTopupNote(t.note)) t.octopusTopup = true;
       data.transactions.push(t);
-      if (isIncome(t)) adjustAccountBalance(t.account, t.amount);
+      applyTxBalanceEffects(t, +1);
     });
     if (plan.subs.length) {
       if (!data.subscriptions) data.subscriptions = [];
@@ -2538,8 +2733,7 @@
         const remoteT = Date.parse(remote.updatedAt) || 0;
         if (remoteT > localT) {
           data = remote;
-          ensureCategoryBudgets();
-          saveLocal();
+          migrateData();
           runMonthRolloverIfNeeded();
           if (showToast) toast("已由 Drive 拉最新資料", "ok");
         } else if (localT > remoteT) {

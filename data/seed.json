@@ -23,23 +23,43 @@
       "id": "acc-bank1",
       "name": "銀行 A",
       "balance": 5000,
-      "asOf": "2026-09-01"
+      "asOf": "2026-09-01",
+      "kind": "bank"
     },
     {
       "id": "acc-bank2",
       "name": "銀行 B",
       "balance": 1200,
-      "asOf": "2026-09-01"
+      "asOf": "2026-09-01",
+      "kind": "bank"
+    },
+    {
+      "id": "acc-octopus",
+      "name": "八達通",
+      "balance": 100,
+      "asOf": "2026-09-01",
+      "kind": "wallet",
+      "notes": "示範錢包，非真實結餘"
+    },
+    {
+      "id": "acc-enjoy",
+      "name": "enJoy",
+      "balance": 0,
+      "asOf": "2026-09-01",
+      "kind": "card",
+      "notes": "示範信用卡戶口標籤；唔計入「而家可以用」"
     },
     {
       "id": "acc-cash",
       "name": "現金",
-      "balance": 300
+      "balance": 300,
+      "kind": "bank"
     },
     {
       "id": "acc-other",
       "name": "其他",
-      "balance": 0
+      "balance": 0,
+      "kind": "bank"
     }
   ],
   "cards": [

@@ -823,3 +823,5 @@ a {
 .more-details .card { box-shadow: none; }
 .ledger-month-chips { margin: 0 0 10px; }
 .month-chip { margin-left: 0; margin-right: 0; }
+
+.ledger-tip { margin-bottom: 12px; }
